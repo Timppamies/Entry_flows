@@ -7,89 +7,72 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-# Sovelluksen sivun asetukset
 st.set_page_config(
     page_title="FinBalt Natural Gas Entry Flows",
     page_icon="🔥",
     layout="wide"
 )
 
-
-# --- 1. ENTSOG DATA: HAKU JA LUOKITTELU ---
-
-def classify_entry_point(row):
-    """
-    Tunnistaa ja luokittelee syöttöpisteet pointLabel-, pointKey- ja operatorLabel-kentistä.
-    """
-    point_label = str(row.get('pointLabel', '')).lower()
-    point_key = str(row.get('pointKey', '')).lower()
-    operator_label = str(row.get('operatorLabel', '')).lower()
-    
-    combined = f"{point_label} {point_key} {operator_label}"
-
-    # 1. Inčukalns-varasto (withdrawal)
-    if 'incukalns' in combined or 'inčukalns' in combined:
-        return 'Inčukalns UGS (Withdrawal)'
-
-    # 2. Klaipėda LNG
-    if 'klaip' in combined or 'independence' in combined:
-        return 'Klaipėda LNG'
-
-    # 3. Inkoo & Hamina LNG
-    if 'inkoo' in combined or 'hamina' in combined:
-        return 'Inkoo & Hamina LNG'
-
-    # 4. GIPL (Puola -> Liettua)
-    if 'gipl' in combined or 'santaka' in combined or 'hołowczyce' in combined or 'holowczyce' in combined:
-        return 'GIPL (Poland -> LT)'
-
-    return None
-
+# --- 1. ENTSOG MÄÄRITTELYT (Pisteet & Koodit) ---
+# Määritetään suorat ENTSOG pointKey- ja operatorKey -yhdystiedot
+ENTRY_CONFIG = [
+    {
+        'category': 'Inkoo & Hamina LNG',
+        'operatorKey': 'FI-TSO-0001',
+        'pointKey': 'ITP-00495'  # Inkoo / FSRU
+    },
+    {
+        'category': 'Inkoo & Hamina LNG',
+        'operatorKey': 'FI-TSO-0001',
+        'pointKey': 'ITP-00508'  # Hamina LNG
+    },
+    {
+        'category': 'Klaipėda LNG',
+        'operatorKey': 'LT-TSO-0001',
+        'pointKey': 'ITP-00163'  # Klaipėda LNG Terminal (Independence)
+    },
+    {
+        'category': 'GIPL (Poland -> LT)',
+        'operatorKey': 'LT-TSO-0001',
+        'pointKey': 'ITP-00500'  # Santaka / GIPL
+    },
+    {
+        'category': 'Inčukalns UGS (Withdrawal)',
+        'operatorKey': 'LV-TSO-0001',
+        'pointKey': 'ITP-00160'  # Inčukalns UGS
+    }
+]
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_entsog_operator_entry_data(operator_key, start_date_str, end_date_str):
+def fetch_single_point_data(operator_key, point_key, start_date_str, end_date_str):
     """
-    Hakee tietyn operaattorin entry-virrat ENTSOG APIsta annetulta aikaväliltä.
+    Hakee täsmällisen yksittäisen syöttöpisteen datan ENTSOG APIsta.
+    Erittäin nopea, koska haetaan vain yksi tietovirta.
     """
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
-    offset = 0
-    limit = 5000
-    all_records = []
-
-    while True:
-        params = {
-            'indicator': 'Physical Flow',
-            'from': start_date_str,
-            'to': end_date_str,
-            'limit': limit,
-            'offset': offset,
-            'directionKey': 'entry',
-            'operatorKey': operator_key
-        }
-
-        try:
-            response = requests.get(url, params=params, timeout=15)
-            if response.status_code == 200:
-                data = response.json().get('operationalData', [])
-                if not data:
-                    break
-                all_records.extend(data)
-                if len(data) < limit:
-                    break
-                offset += limit
-            else:
-                break
-        except Exception:
-            break
-
-    return all_records
+    params = {
+        'indicator': 'Physical Flow',
+        'from': start_date_str,
+        'to': end_date_str,
+        'limit': 5000,
+        'directionKey': 'entry',
+        'operatorKey': operator_key,
+        'pointKey': point_key
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json().get('operationalData', [])
+    except Exception:
+        pass
+    return []
 
 
-@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt 24kk kaasusyöttöhistoriaa ENTSOG-rajapinnasta...")
-def fetch_full_entsog_entry_history():
+@st.cache_data(ttl=86400, show_spinner="Haetaan FinBalt gas entry -virtoja ENTSOG-rajapinnasta...")
+def fetch_all_entry_flows():
     """
-    Lataa 24 kuukauden historiandatan taustalle muistiin.
-    Kattaa Suomen, Latvian, Liettuan ja Puolan siirtoverkonhaltijat.
+    Lataa 24kk datan määritellyistä pisteistä rinnakkaisesti/nopeasti.
     """
     today = datetime.today()
     first_day_current_month = today.replace(day=1)
@@ -98,15 +81,20 @@ def fetch_full_entsog_entry_history():
     start_date_str = start_dt.strftime('%Y-%m-%d')
     end_date_str = today.strftime('%Y-%m-%d')
 
-    # FI (Gasgrid), LV (Conexus), LT (Amber Grid), PL (Gaz-System)
-    operators = ['FI-TSO-0001', 'LV-TSO-0001', 'LT-TSO-0001', 'PL-TSO-0001']
-    all_data = []
+    all_records = []
 
-    for op in operators:
-        records = fetch_entsog_operator_entry_data(op, start_date_str, end_date_str)
-        all_data.extend(records)
+    for item in ENTRY_CONFIG:
+        records = fetch_single_point_data(
+            item['operatorKey'], 
+            item['pointKey'], 
+            start_date_str, 
+            end_date_str
+        )
+        for r in records:
+            r['Category'] = item['category']
+            all_records.append(r)
 
-    return pd.DataFrame(all_data)
+    return pd.DataFrame(all_records)
 
 
 # --- 2. KÄYTTÖLIITTYMÄ (STREAMLIT UI) ---
@@ -121,102 +109,93 @@ if st.sidebar.button("Clear Cache & Refresh 🔄"):
     st.cache_data.clear()
     st.rerun()
 
-# Datan lataus
-df_raw = fetch_full_entsog_entry_history()
+# Datan haku (Nopea täsmähaku)
+df_raw = fetch_all_entry_flows()
 
 if df_raw.empty:
-    st.warning("Ei saatu yhteyttä ENTSOG API-rajapintaan. Yritä napsauttaa 'Clear Cache & Refresh'.")
+    st.warning("Ei saatu yhteyttä ENTSOG API-rajapintaan tai dataa ei löytynyt pisteille.")
 else:
-    df_raw['Category'] = df_raw.apply(classify_entry_point, axis=1)
-    df_filtered = df_raw.dropna(subset=['Category']).copy()
+    # Tunnetut päivämääräsarakkeet
+    date_candidates = ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn']
+    date_col = next((c for c in date_candidates if c in df_raw.columns), None)
+    if not date_col:
+        date_col = next((c for c in df_raw.columns if 'period' in c.lower() or 'date' in c.lower()), None)
 
-    if df_filtered.empty:
-        st.warning("Ei löydetty syöttövirtoja suodattimilla. ENTSOG-pisteiden luokittelun hakusanoja voi olla tarpeen tarkentaa.")
-    else:
-        # Tunnistetaan päivämääräsarake API-vastauksesta
-        date_candidates = ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn']
-        date_col = next((c for c in date_candidates if c in df_filtered.columns), None)
-        if not date_col:
-            date_col = next((c for c in df_filtered.columns if 'period' in c.lower() or 'date' in c.lower()), None)
+    df_raw['value'] = pd.to_numeric(df_raw['value'], errors='coerce').fillna(0)
+    df_raw['Date_Parsed'] = pd.to_datetime(df_raw[date_col], utc=True)
+    df_raw['Month'] = df_raw['Date_Parsed'].dt.strftime('%Y-%m')
 
-        df_filtered['value'] = pd.to_numeric(df_filtered['value'], errors='coerce').fillna(0)
-        df_filtered['Date_Parsed'] = pd.to_datetime(df_filtered[date_col], utc=True)
-        df_filtered['Month'] = df_filtered['Date_Parsed'].dt.strftime('%Y-%m')
+    # Aggregoidaan kuukausitasolle (kWh -> TWh muunnos: / 1e9)
+    monthly_summary = df_raw.groupby(['Month', 'Category'])['value'].sum().reset_index()
+    monthly_summary['Value_TWh'] = monthly_summary['value'] / 1e9
 
-        # Aggregointi kuukausitasolle (kWh -> TWh muunnos jakamalla 1e9:llä)
-        monthly_summary = df_filtered.groupby(['Month', 'Category'])['value'].sum().reset_index()
-        monthly_summary['Value_TWh'] = monthly_summary['value'] / 1e9
+    pivot_df = monthly_summary.pivot(index='Month', columns='Category', values='Value_TWh').fillna(0)
 
-        pivot_df = monthly_summary.pivot(index='Month', columns='Category', values='Value_TWh').fillna(0)
+    categories_order = [
+        'Inčukalns UGS (Withdrawal)', 
+        'GIPL (Poland -> LT)', 
+        'Klaipėda LNG', 
+        'Inkoo & Hamina LNG'
+    ]
 
-        categories_order = [
-            'Inčukalns UGS (Withdrawal)', 
-            'GIPL (Poland -> LT)', 
-            'Klaipėda LNG', 
-            'Inkoo & Hamina LNG'
-        ]
+    # Varmistetaan sarakkeiden läsnäolo
+    for col in categories_order:
+        if col not in pivot_df.columns:
+            pivot_df[col] = 0.0
 
-        # Varmistetaan että kaikki 4 kategoriaa löytyvät taulukosta
-        for col in categories_order:
-            if col not in pivot_df.columns:
-                pivot_df[col] = 0.0
+    pivot_df = pivot_df[categories_order]
+    df_display = pivot_df.tail(months_to_show)
 
-        pivot_df = pivot_df[categories_order]
+    latest_month = df_display.index[-1]
+    latest_total = df_display.loc[latest_month].sum()
 
-        # Slider-rajaus suoraan muistista (viiveetön)
-        df_display = pivot_df.tail(months_to_show)
+    # --- Metrics ---
+    st.subheader(f"Latest Month Overview ({latest_month})")
+    m_cols = st.columns(len(categories_order) + 1)
 
-        latest_month = df_display.index[-1]
-        latest_total = df_display.loc[latest_month].sum()
+    m_cols[0].metric(label="Total Supply", value=f"{latest_total:.3f} TWh")
+    for idx, col in enumerate(categories_order):
+        val = df_display.loc[latest_month, col]
+        m_cols[idx + 1].metric(label=col, value=f"{val:.3f} TWh")
 
-        # --- Yhteenvetokortit (Metrics) ---
-        st.subheader(f"Latest Month Overview ({latest_month})")
-        m_cols = st.columns(len(categories_order) + 1)
+    st.markdown("---")
 
-        m_cols[0].metric(label="Total Supply", value=f"{latest_total:.3f} TWh")
-        for idx, col in enumerate(categories_order):
-            val = df_display.loc[latest_month, col]
-            m_cols[idx + 1].metric(label=col, value=f"{val:.3f} TWh")
+    # --- Graph ---
+    st.subheader("Monthly Gas Supply by Route (TWh)")
+    plot_df = df_display.reset_index().melt(id_vars='Month', var_name='Entry Route', value_name='TWh')
 
-        st.markdown("---")
+    fig = px.bar(
+        plot_df, 
+        x='Month', 
+        y='TWh', 
+        color='Entry Route',
+        title=f"FinBalt Natural Gas Entry Flows (Last {months_to_show} Months)",
+        labels={'TWh': 'Energy (TWh / month)', 'Month': 'Month'},
+        template='plotly_white',
+        color_discrete_sequence=px.colors.qualitative.Set2
+    )
 
-        # --- Plotly Interaktiivinen Pylväskaavio ---
-        st.subheader("Monthly Gas Supply by Route (TWh)")
+    fig.update_layout(
+        barmode='stack',
+        xaxis_tickangle=-45,
+        legend_title_text='Supply Route',
+        height=500,
+        hovermode="x unified"
+    )
 
-        plot_df = df_display.reset_index().melt(id_vars='Month', var_name='Entry Route', value_name='TWh')
+    st.plotly_chart(fig, use_container_width=True)
 
-        fig = px.bar(
-            plot_df, 
-            x='Month', 
-            y='TWh', 
-            color='Entry Route',
-            title=f"FinBalt Natural Gas Entry Flows (Last {months_to_show} Months)",
-            labels={'TWh': 'Energy (TWh / month)', 'Month': 'Month'},
-            template='plotly_white',
-            color_discrete_sequence=px.colors.qualitative.Set2
-        )
+    # --- Table & CSV ---
+    st.subheader("Data Summary Table")
+    display_df = df_display.copy()
+    display_df['Total (TWh)'] = display_df.sum(axis=1)
 
-        fig.update_layout(
-            barmode='stack',
-            xaxis_tickangle=-45,
-            legend_title_text='Supply Route',
-            height=500,
-            hovermode="x unified"
-        )
+    st.dataframe(display_df.style.format("{:.3f}"), use_container_width=True)
 
-        st.plotly_chart(fig, use_container_width=True)
-
-        # --- Taulukko & CSV-lataus ---
-        st.subheader("Data Summary Table")
-        display_df = df_display.copy()
-        display_df['Total (TWh)'] = display_df.sum(axis=1)
-
-        st.dataframe(display_df.style.format("{:.3f}"), use_container_width=True)
-
-        csv_data = display_df.to_csv().encode('utf-8')
-        st.download_button(
-            label="Download Data as CSV 📥",
-            data=csv_data,
-            file_name=f"finbalt_gas_entry_flows_{latest_month}.csv",
-            mime="text/csv"
-        )
+    csv_data = display_df.to_csv().encode('utf-8')
+    st.download_button(
+        label="Download Data as CSV 📥",
+        data=csv_data,
+        file_name=f"finbalt_gas_entry_flows_{latest_month}.csv",
+        mime="text/csv"
+    )
