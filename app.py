@@ -14,97 +14,109 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: OPTIMOITU TÄSMÄHAKU (4 KUTSUA) ---
+# --- 1. ENTSOG DATA: SALAMAHAKU JA ÄLYKÄS SUODATUS ---
 
-@st.cache_data(ttl=86400, show_spinner="Noudetaan dataa ENTSOG-rajapinnasta (kestää n. 2-3 sekuntia)...")
-def fetch_entsog_fast():
+def get_category(row):
+    pk = str(row.get('pointKey', '')).upper()
+    pl = str(row.get('pointLabel', '')).lower()
+    
+    if pk in ['ITP-00495', 'ITP-00508']:
+        return 'Inkoo & Hamina LNG'
+    if 'incukalns' in pl or 'inčukalns' in pl:
+        return 'Inčukalns UGS (Withdrawal)'
+    if 'klaip' in pl or 'independence' in pl or 'kn' in pl:
+        if not ('gipl' in pl or 'santaka' in pl):
+            return 'Klaipėda LNG'
+    if 'gipl' in pl or 'santaka' in pl:
+        return 'GIPL (Poland -> LT)'
+    return None
+
+@st.cache_data(ttl=86400, show_spinner="Noudetaan FinBalt gas entry -historiaa (kestää 2-4 sekuntia)...")
+def fetch_full_entsog_entry_history():
     today = datetime.today()
-    # Otetaan noin 24 kuukauden historia
     start_dt = (today.replace(day=1) - timedelta(days=24 * 31)).replace(day=1)
     
     from_str = start_dt.strftime('%Y-%m-%d')
     to_str = today.strftime('%Y-%m-%d')
     
+    all_data = []
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
     
-    # 4 tarkkaa hakua kantaverkkoyhtiöiden tunnuksilla. 
-    # Tämä ohittaa kokonaan LNG-terminaalien virheellisesti raportoimat maksimikapasiteetit.
-    api_configs = [
-        {'op': 'LV-TSO-0001', 'ind': 'Physical Flow'}, # Conexus (Latvia)
-        {'op': 'LT-TSO-0001', 'ind': 'Physical Flow'}, # Amber Grid (Liettua)
-        {'op': 'FI-TSO-0001', 'ind': 'Physical Flow'}, # Gasgrid (Suomi)
-        {'op': 'FI-TSO-0001', 'ind': 'Allocation'}     # Gasgrid (Suomi - todellinen kaupallinen virta)
-    ]
-    
-    all_data = []
-    
-    # Requests Session nopeuttaa toistuvia hakuja
+    # Käytetään Sessionia API-kutsujen nopeuttamiseksi
     with requests.Session() as s:
-        for cfg in api_configs:
-            params = {
-                'from': from_str,
-                'to': to_str,
-                'limit': 5000, # Koko historia mahtuu yhteen pyyntöön per operaattori
-                'directionKey': 'entry',
-                'periodType': 'day',
-                'operatorKey': cfg['op'],
-                'indicator': cfg['ind']
-            }
-            try:
-                r = s.get(url, params=params, timeout=10)
-                if r.status_code == 200:
-                    data = r.json().get('operationalData', [])
-                    all_data.extend(data)
-            except Exception:
-                pass
-                
-    if not all_data:
-        return pd.DataFrame()
+        def fetch(params):
+            offset = 0
+            params['limit'] = 5000
+            while True:
+                params['offset'] = offset
+                try:
+                    resp = s.get(url, params=params, timeout=12)
+                    if resp.status_code == 200:
+                        data = resp.json().get('operationalData', [])
+                        if not data: break
+                        all_data.extend(data)
+                        if len(data) < 5000: break
+                        offset += 5000
+                    else:
+                        break
+                except Exception:
+                    break
+
+        # 1. Baltia (Conexus & Amber Grid) - Vain 2 kutsua
+        for op in ['LV-TSO-0001', 'LT-TSO-0001']:
+            fetch({
+                'indicator': 'Physical Flow', 'from': from_str, 'to': to_str,
+                'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
+            })
         
+        # 2. Suomi (Inkoo & Hamina) - Vain 1 yhdistetty kutsu
+        # Haemme vain Physical Flow, sillä Allocation sisältää haamunollia.
+        fetch({
+            'indicator': 'Physical Flow', 'from': from_str, 'to': to_str,
+            'directionKey': 'entry', 'pointKey': 'ITP-00495,ITP-00508', 'periodType': 'day'
+        })
+
     df = pd.DataFrame(all_data)
-    
-    # --- DATAN PUHDISTUS ---
+    if df.empty:
+        return df
+
+    # Varmistetaan luvut
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
     
-    # Varmistetaan energiayksiköt
+    # Yksikkökorjaus (Jos Suomi raportoi kWh/h, skaalataan se päivävirraksi)
     if 'unit' in df.columns:
         df['unit_low'] = df['unit'].astype(str).str.lower()
-        df = df[df['unit_low'].str.contains('kwh/d|kwh/h')]
-        
-        # Jos Suomi on ilmoittanut luvut tuntitehona (kWh/h), kerrotaan 24:llä
         hourly_mask = df['unit_low'].str.contains('kwh/h')
         df.loc[hourly_mask, 'value'] = df.loc[hourly_mask, 'value'] * 24
 
+    # Perussuodatukset
+    if 'periodType' in df.columns:
+        df = df[df['periodType'].astype(str).str.lower() == 'day']
+    if 'directionKey' in df.columns:
+        df = df[df['directionKey'].astype(str).str.lower() == 'entry']
+
     # Poimitaan päivämäärä
-    date_col = next((c for c in ['periodFrom', 'gasDayStart'] if c in df.columns), 'periodFrom')
+    date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     
-    # Luokittelufunktio
-    def categorize(row):
-        pk = str(row.get('pointKey', '')).upper()
-        pl = str(row.get('pointLabel', '')).lower()
-        if pk in ['ITP-00495', 'ITP-00508']:
-            return 'Inkoo & Hamina LNG'
-        if 'incukalns' in pl or 'inčukalns' in pl:
-            return 'Inčukalns UGS (Withdrawal)'
-        if 'klaip' in pl or 'independence' in pl or 'kn' in pl:
-            if not ('gipl' in pl or 'santaka' in pl):
-                return 'Klaipėda LNG'
-        if 'gipl' in pl or 'santaka' in pl:
-            return 'GIPL (Poland -> LT)'
-        return None
-        
-    df['Category'] = df.apply(categorize, axis=1)
+    # Luokitellaan maantieteellisesti
+    df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
+
+    # --- LOPULLINEN RATKAISU: ÄLYKÄS DATA-SPLIT ---
     
-    # Duplikaattien karsinta
-    # Jos Gasgrid raportoi samalle päivälle Allocation ja Physical Flow, suositaan Allocationia
-    df['ind_rank'] = df['indicator'].astype(str).str.lower().map({'allocation': 1, 'physical flow': 2}).fillna(3)
-    df = df.sort_values(['Category', 'pointKey', 'Date', 'ind_rank'])
+    # 1. Suomen luvut (Inkoo & Hamina)
+    # Suomen rajapinta palauttaa samaan aikaan todellisen virran (esim. 16 GWh tai 0 GWh) JA maksimikapasiteetin (140 GWh).
+    # Ottamalla MINIMIN, kapasiteettihuijaus ohitetaan täydellisesti ja käteen jää aito virtaus!
+    df_fin = df[df['Category'] == 'Inkoo & Hamina LNG'].groupby(['Category', 'pointKey', 'Date'], as_index=False)['value'].min()
     
-    # Pidetään täsmälleen yksi totuus per piste ja päivä
-    df_clean = df.drop_duplicates(subset=['Category', 'pointKey', 'Date'], keep='first')
+    # 2. Baltian luvut (Klaipeda, GIPL, Incukalns)
+    # Baltia raportoi datansa puhtaasti. Ottamalla MAKSIMIN vältämme mahdolliset 'haamunollat', joita heidän järjestelmänsä joskus syöttää.
+    df_balt = df[df['Category'] != 'Inkoo & Hamina LNG'].groupby(['Category', 'pointKey', 'Date'], as_index=False)['value'].max()
     
+    # Yhdistetään puhtaat datat
+    df_clean = pd.concat([df_fin, df_balt], ignore_index=True)
+
     return df_clean
 
 
@@ -120,7 +132,7 @@ if st.sidebar.button("Clear Cache & Refresh 🔄"):
     st.cache_data.clear()
     st.rerun()
 
-df_raw = fetch_entsog_fast()
+df_raw = fetch_full_entsog_entry_history()
 
 if df_raw.empty:
     st.warning("Ei saatu yhteyttä ENTSOG API-rajapintaan tai data on tyhjä. Napsauta 'Clear Cache & Refresh'.")
