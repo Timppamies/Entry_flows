@@ -14,16 +14,14 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: ÄLYKÄS INDIKAATTORISUODATUS ---
+# --- 1. ENTSOG DATA: NOPEA JA TURVALLINEN OPERAATTORIHAKU ---
 
+# Haetaan kaikki 3 maata puhtaasti virallisilla TSO-koodeilla, mikä pakottaa ENTSOGin 
+# kunnioittamaan Physical Flow -rajausta (estää kapasiteettiroskan).
 OPERATORS = [
-    'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
-    'LT-TSO-0001', # Amber Grid (Klaipėda, GIPL)
-]
-
-FINLAND_POINTS = [
-    'ITP-00495', # Inkoo FSRU
-    'ITP-00508', # Hamina LNG
+    'FI-TSO-0001', # Gasgrid Finland (Sisältää Inkoon ja Haminan)
+    'LV-TSO-0001', # Conexus Baltic Grid
+    'LT-TSO-0001', # Amber Grid
 ]
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -34,7 +32,6 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
     chunk_records = []
 
     while True:
-        # Baltian osalta Physical Flow toimii suoraan ja on nopea
         params = {
             'indicator': 'Physical Flow',
             'from': from_str,
@@ -43,43 +40,6 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
             'offset': offset,
             'directionKey': 'entry',
             'operatorKey': operator_key,
-            'periodType': 'day'
-        }
-
-        try:
-            response = requests.get(url, params=params, timeout=12)
-            if response.status_code == 200:
-                data = response.json().get('operationalData', [])
-                if not data:
-                    break
-                chunk_records.extend(data)
-                if len(data) < limit:
-                    break
-                offset += limit
-            else:
-                break
-        except Exception:
-            break
-
-    return chunk_records
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_entsog_point_chunk(point_key, from_str, to_str):
-    url = "https://transparency.entsog.eu/api/v1/operationalData.json"
-    offset = 0
-    limit = 5000
-    chunk_records = []
-
-    while True:
-        # HUOM: Suomen pisteiltä EI pyydetä pelkkää 'Physical Flow' -indikaattoria, 
-        # koska Inkoo/Hamina saattavat raportoida virtansa 'Allocation'-indikaattorilla.
-        params = {
-            'from': from_str,
-            'to': to_str,
-            'limit': limit,
-            'offset': offset,
-            'directionKey': 'entry',
-            'pointKey': point_key,
             'periodType': 'day'
         }
 
@@ -115,16 +75,9 @@ def fetch_full_entsog_entry_history():
 
     all_data = []
 
-    # 1. Haetaan Baltia
     for op in OPERATORS:
         for from_str, to_str in date_ranges:
             records = fetch_entsog_operator_chunk(op, from_str, to_str)
-            all_data.extend(records)
-
-    # 2. Haetaan Suomen LNG-terminaalit
-    for point_key in FINLAND_POINTS:
-        for from_str, to_str in date_ranges:
-            records = fetch_entsog_point_chunk(point_key, from_str, to_str)
             all_data.extend(records)
 
     df = pd.DataFrame(all_data)
@@ -138,55 +91,54 @@ def fetch_full_entsog_entry_history():
         if 'directionKey' in df.columns:
             df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-        # --- RATKAISU: Sallitaan sekä Physical Flow ETTÄ Allocation ---
-        # Tämä karsii pois Inkoon kapasiteettiluvut (Firm Technical Capacity), 
-        # mutta jättää todellisen virran riippumatta siitä kumpaa termiä satamaan käytetään.
-        if 'indicator' in df.columns:
-            valid_inds = ['physical flow', 'allocation']
-            df = df[df['indicator'].astype(str).str.lower().isin(valid_inds)]
-
+        # Yksikkökorjaus: Jos API palauttaa tuntiarvoja, skaalataan ne vuorokausiarvoiksi
         unit_col = next((c for c in ['unitKey', 'unit'] if c in df.columns), None)
         if unit_col:
-            df = df[df[unit_col].astype(str).str.lower().str.contains('kwh/d|energy')]
+            is_hourly = df[unit_col].astype(str).str.lower().str.contains('/h')
+            df.loc[is_hourly, 'value'] = df.loc[is_hourly, 'value'] * 24
 
-        date_col_raw = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
-        if date_col_raw:
-            df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
+        date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
+        if date_col:
+            df['Clean_Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
             
-            # Ryhmitellään ja otetaan maksimi/summa per piste ja päivä, jotta mahdolliset duplikaatit poistuvat
-            df = df.groupby(['pointKey', 'Clean_Date'], as_index=False).agg({
-                'value': 'max',
-                'pointLabel': 'first',
-                'operatorKey': 'first',
-                'operatorLabel': 'first',
-                'directionKey': 'first'
-            })
+            # Valitaan duplikaateista paras (uusin tai oikea Actual-tila) kapasiteettimaksimin sijaan
+            if 'statusKey' in df.columns:
+                df['is_actual'] = df['statusKey'].astype(str).str.lower() == 'actual'
+            else:
+                df['is_actual'] = True
+                
+            if 'version' in df.columns:
+                df['ver_num'] = pd.to_numeric(df['version'], errors='coerce').fillna(0)
+            else:
+                df['ver_num'] = 1
+                
+            # Lajitellaan niin, että oikein ja uusin on viimeisenä, ja pudotetaan aiemmat
+            df = df.sort_values(['pointKey', 'Clean_Date', 'is_actual', 'ver_num'], ascending=[True, True, True, True])
+            df = df.drop_duplicates(subset=['pointKey', 'Clean_Date'], keep='last')
 
     return df
 
 
 def classify_entry_flow(row):
-    point_label = str(row.get('pointLabel', '')).lower()
-    point_key = str(row.get('pointKey', '')).lower()
-    operator_label = str(row.get('operatorLabel', '')).lower()
-    combined = f"{point_label} {point_key} {operator_label}"
+    pk = str(row.get('pointKey', '')).upper()
+    pl = str(row.get('pointLabel', '')).lower()
 
-    # 1. Inčukalns-varasto (Latvia)
-    if 'incukalns' in combined or 'inčukalns' in combined:
+    # 1. Suomi: Täysin tiukka kohdistus suoraan Inkoon ja Haminan pistekoodeihin (ei päästä esim. Baltconnectoria tähän summaan)
+    if pk in ['ITP-00495', 'ITP-00508']:
+        return 'Inkoo & Hamina LNG'
+
+    # 2. Latvia (Inčukalns)
+    if 'incukalns' in pl or 'inčukalns' in pl:
         return 'Inčukalns UGS (Withdrawal)'
 
-    # 2. Klaipėda LNG (Liettua)
-    if 'klaip' in combined or 'independence' in combined or 'kn' in combined:
-        if not ('gipl' in combined or 'santaka' in combined):
+    # 3. Liettua (Klaipėda LNG)
+    if 'klaip' in pl or 'independence' in pl or 'kn' in pl:
+        if not ('gipl' in pl or 'santaka' in pl):
             return 'Klaipėda LNG'
 
-    # 3. GIPL (Puola -> Liettua)
-    if 'gipl' in combined or 'santaka' in combined or 'poland' in combined:
+    # 4. Liettua (GIPL)
+    if 'gipl' in pl or 'santaka' in pl:
         return 'GIPL (Poland -> LT)'
-
-    # 4. Inkoo & Hamina LNG (Suomi - pistekoodit ITP-00495 ja ITP-00508)
-    if 'itp-00495' in combined or 'itp-00508' in combined or 'inkoo' in combined or 'hamina' in combined or 'fsru' in combined:
-        return 'Inkoo & Hamina LNG'
 
     return None
 
