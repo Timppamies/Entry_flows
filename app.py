@@ -41,136 +41,89 @@ def get_category(row):
         return 'GIPL (Poland -> LT)'
     return None
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_entsog_operator_chunk(operator_key, from_str, to_str, indicator):
-    url = "https://transparency.entsog.eu/api/v1/operationalData.json"
-    offset = 0
-    limit = 5000
-    chunk_records = []
-
-    while True:
-        params = {
-            'indicator': indicator,
-            'from': from_str,
-            'to': to_str,
-            'limit': limit,
-            'offset': offset,
-            'directionKey': 'entry',
-            'operatorKey': operator_key,
-            'periodType': 'day'
-        }
-        try:
-            response = requests.get(url, params=params, timeout=12)
-            if response.status_code == 200:
-                data = response.json().get('operationalData', [])
-                if not data: break
-                chunk_records.extend(data)
-                if len(data) < limit: break
-                offset += limit
-            else:
-                break
-        except Exception:
-            break
-    return chunk_records
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_entsog_point_chunk(point_key, from_str, to_str, indicator):
-    url = "https://transparency.entsog.eu/api/v1/operationalData.json"
-    offset = 0
-    limit = 5000
-    chunk_records = []
-
-    while True:
-        params = {
-            'indicator': indicator,
-            'from': from_str,
-            'to': to_str,
-            'limit': limit,
-            'offset': offset,
-            'directionKey': 'entry',
-            'pointKey': point_key,
-            'periodType': 'day'
-        }
-        try:
-            response = requests.get(url, params=params, timeout=12)
-            if response.status_code == 200:
-                data = response.json().get('operationalData', [])
-                if not data: break
-                chunk_records.extend(data)
-                if len(data) < limit: break
-                offset += limit
-            else:
-                break
-        except Exception:
-            break
-    return chunk_records
-
-@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (noin 10 sekuntia)...")
+@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (optimoitu salamahaku)...")
 def fetch_full_entsog_entry_history():
     today = datetime.today()
-    first_day_current_month = today.replace(day=1)
-    start_dt = (first_day_current_month - timedelta(days=24 * 31)).replace(day=1)
-    mid_dt = start_dt + timedelta(days=365)
+    start_dt = (today.replace(day=1) - timedelta(days=24 * 31)).replace(day=1)
     
-    date_ranges = [
-        (start_dt.strftime('%Y-%m-%d'), mid_dt.strftime('%Y-%m-%d')),
-        ((mid_dt + timedelta(days=1)).strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d'))
-    ]
+    # ENTSOGin rivirajoitus (5000) riittää kirkkaasti yhdelle pisteelle 2 vuoden hakuun (730 riviä).
+    # Ei enää pätkitä päivämääriä, jolloin API-kutsujen määrä putoaa minimiin!
+    from_str = start_dt.strftime('%Y-%m-%d')
+    to_str = today.strftime('%Y-%m-%d')
 
     all_data = []
+    
+    # Käytetään Sessionia, joka pitää yhteyden auki ja nopeuttaa hakuja merkittävästi
+    session = requests.Session()
+    url = "https://transparency.entsog.eu/api/v1/operationalData.json"
 
-    # Baltian operaattoreille riittää 'Physical Flow'
+    def fetch_data(params):
+        try:
+            resp = session.get(url, params=params, timeout=15)
+            if resp.status_code == 200:
+                return resp.json().get('operationalData', [])
+        except Exception:
+            pass
+        return []
+
+    # 1. Baltia (Pelkkä Physical Flow riittää)
     for op in OPERATORS:
-        for from_str, to_str in date_ranges:
-            all_data.extend(fetch_entsog_operator_chunk(op, from_str, to_str, 'Physical Flow'))
+        all_data.extend(fetch_data({
+            'indicator': 'Physical Flow',
+            'from': from_str, 'to': to_str, 'limit': 5000,
+            'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
+        }))
 
-    # Suomen pisteille haetaan myös Allocation ja Nomination, jotta oikea virta löytyy kapasiteetin sijaan
+    # 2. Suomi (Haetaan Allocation JA Physical Flow erikseen)
     for pk in FINLAND_POINTS:
-        for ind in ['Allocation', 'Physical Flow', 'Nomination']:
-            for from_str, to_str in date_ranges:
-                all_data.extend(fetch_entsog_point_chunk(pk, from_str, to_str, ind))
+        for ind in ['Allocation', 'Physical Flow']:
+            all_data.extend(fetch_data({
+                'indicator': ind,
+                'from': from_str, 'to': to_str, 'limit': 5000,
+                'directionKey': 'entry', 'pointKey': pk, 'periodType': 'day'
+            }))
 
     df = pd.DataFrame(all_data)
     if df.empty:
         return df
 
-    # Varmistetaan luvut ja päivämäärät
+    # Varmistetaan luvut
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
     
+    # Perussuodatukset
     if 'periodType' in df.columns:
         df = df[df['periodType'].astype(str).str.lower() == 'day']
     if 'directionKey' in df.columns:
         df = df[df['directionKey'].astype(str).str.lower() == 'entry']
+        
+    # HUOM: Sallitaan nyt vihdoin molemmat indikaattorit (Tässä oli aiemman koodin virhe!)
+    if 'indicator' in df.columns:
+        valid_inds = ['physical flow', 'allocation']
+        df = df[df['indicator'].astype(str).str.lower().isin(valid_inds)]
 
+    # Poimitaan päivämäärä
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     
-    # Luokitellaan kategoriat
+    # Luokitellaan maantieteellisesti
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- ÄLYKÄS DUPLIKAATTIEN PURKU (Ohittaa ENTSOGin kapasiteettivirheet) ---
+    # --- ÄLYKÄS DUPLIKAATTIEN PURKU (Ohittaa 140 GWh kapasiteettivirheet) ---
     def pick_best_flow(group):
-        # 1. Priorisoidaan "Allocation" -tieto (Allokoitu todellinen virta)
+        # 1. Ensisijaisesti 'Allocation' (Tämä on todellinen virta, n. 16 GWh/päivä)
         alloc = group[group['indicator'].astype(str).str.lower() == 'allocation']
         if not alloc.empty:
-            # Otetaan mieluiten kantaverkkoyhtiön (Gasgrid) lukema
-            tso = alloc[alloc['operatorKey'].astype(str).str.upper() == 'FI-TSO-0001']
-            if not tso.empty:
-                return tso.loc[tso['value'].idxmax()]
-            return alloc.loc[alloc['value'].idxmax()]
+            pos = alloc[alloc['value'] > 0]
+            # Valitaan pienin nollasta poikkeava (tai 0 jos ei ollut virtaa)
+            return pos.loc[pos['value'].idxmin()] if not pos.empty else alloc.iloc[0]
             
-        # 2. Jos Allokaatiota ei ole, tarkistetaan "Physical Flow"
+        # 2. Jos Allokaatiota ei jostain syystä ole, käytetään 'Physical Flow'
         phys = group[group['indicator'].astype(str).str.lower() == 'physical flow']
         if not phys.empty:
-            # Koska LNG-operaattori voi raportoida tähän maksimikapasiteettinsa (140 GWh),
-            # valitsemme PIENIMMÄN arvon, joka kuvastaa todellista virtaa.
-            return phys.loc[phys['value'].idxmin()]
-            
-        # 3. Viimeisenä oljenkortena "Nomination"
-        nom = group[group['indicator'].astype(str).str.lower() == 'nomination']
-        if not nom.empty:
-            return nom.loc[nom['value'].idxmin()]
+            pos = phys[phys['value'] > 0]
+            # Ottamalla pienimmän ohitamme 140 GWh "Firm Technical Capacity" -harhan
+            return pos.loc[pos['value'].idxmin()] if not pos.empty else phys.iloc[0]
             
         return group.iloc[0]
 
