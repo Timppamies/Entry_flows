@@ -220,4 +220,5 @@ else:
         label="Download Data as CSV 📥",
         data=csv_data,
         file_name=f"finbalt_gas_entry_flows_{latest_month}.csv",
-        mime="
+        mime="text/csv"
+    )
