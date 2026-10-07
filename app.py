@@ -14,23 +14,32 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: NOPEA HAKU KORJATUILLA PISTEHAULLA ---
+# --- 1. ENTSOG DATA: NOPEA JA VAKAA HAKU ---
 
-OPERATORS = ['LV-TSO-0001', 'LT-TSO-0001']
-FINLAND_POINTS = ['ITP-00495', 'ITP-00508']
+OPERATORS = [
+    'LV-TSO-0001', # Conexus Baltic Grid
+    'LT-TSO-0001', # Amber Grid
+    'FI-TSO-0001'  # Gasgrid Finland (Suomen virallinen siirtoverkko)
+]
 
 def get_category(row):
     pk = str(row.get('pointKey', '')).upper()
     pl = str(row.get('pointLabel', '')).lower()
+    op = str(row.get('operatorKey', '')).upper()
     
-    if pk in FINLAND_POINTS: return 'Inkoo & Hamina LNG'
-    if 'incukalns' in pl or 'inčukalns' in pl: return 'Inčukalns UGS (Withdrawal)'
+    # Suomen kantaverkon (Gasgrid) pisteet
+    if op == 'FI-TSO-0001':
+        return 'Inkoo & Hamina LNG'
+    if 'incukalns' in pl or 'inčukalns' in pl:
+        return 'Inčukalns UGS (Withdrawal)'
     if 'klaip' in pl or 'independence' in pl or 'kn' in pl:
-        if not ('gipl' in pl or 'santaka' in pl): return 'Klaipėda LNG'
-    if 'gipl' in pl or 'santaka' in pl: return 'GIPL (Poland -> LT)'
+        if not ('gipl' in pl or 'santaka' in pl):
+            return 'Klaipėda LNG'
+    if 'gipl' in pl or 'santaka' in pl:
+        return 'GIPL (Poland -> LT)'
     return None
 
-@st.cache_data(ttl=3600, show_spinner="Noudetaan dataa ENTSOG-rajapinnasta (kestää noin 10-15 sekuntia)...")
+@st.cache_data(ttl=3600, show_spinner="Noudetaan dataa ENTSOG-rajapinnasta (noin 5-10 sekuntia)...")
 def fetch_fast_entsog_data():
     today = datetime.today()
     start_dt = (today.replace(day=1) - timedelta(days=24 * 31)).replace(day=1)
@@ -38,6 +47,7 @@ def fetch_fast_entsog_data():
     from_str = start_dt.strftime('%Y-%m-%d')
     to_str = today.strftime('%Y-%m-%d')
     
+    # Jaetaan kysely kahteen osaan API-vakauden varmistamiseksi
     date_ranges = [
         (from_str, (start_dt + timedelta(days=365)).strftime('%Y-%m-%d')),
         (((start_dt + timedelta(days=365+1)).strftime('%Y-%m-%d')), to_str)
@@ -53,7 +63,7 @@ def fetch_fast_entsog_data():
             while True:
                 params['offset'] = offset
                 try:
-                    r = s.get(url, params=params, timeout=15)
+                    r = s.get(url, params=params, timeout=12)
                     if r.status_code == 200:
                         d = r.json().get('operationalData', [])
                         if not d: break
@@ -66,20 +76,16 @@ def fetch_fast_entsog_data():
                     break
 
         for d_start, d_end in date_ranges:
-            # 1. Baltia (Klaipeda, GIPL, Incukalns)
+            # Haetaan kantaverkkoyhtiöiden (Baltia + Suomi) datat suoraan operaattoreittain
             for op in OPERATORS:
                 fetch_api({
-                    'indicator': 'Physical Flow', 'from': d_start, 'to': d_end,
-                    'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
+                    'indicator': 'Physical Flow', 
+                    'from': d_start, 
+                    'to': d_end,
+                    'directionKey': 'entry', 
+                    'operatorKey': op, 
+                    'periodType': 'day'
                 })
-            
-            # 2. Suomi (Haetaan Inkoo ja Hamina erikseen molemmilla indikaattoreilla)
-            for pk in FINLAND_POINTS:
-                for ind in ['Physical Flow', 'Allocation']:
-                    fetch_api({
-                        'indicator': ind, 'from': d_start, 'to': d_end,
-                        'directionKey': 'entry', 'pointKey': pk, 'periodType': 'day'
-                    })
 
     df = pd.DataFrame(all_data)
     return df
@@ -115,19 +121,9 @@ else:
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- KAPASITEETTILEIKKURI (Suodattaa 140 GWh / 40 GWh haamut pois) ---
-    is_inkoo = (df['pointKey'].astype(str).str.upper() == 'ITP-00495')
-    is_hamina = (df['pointKey'].astype(str).str.upper() == 'ITP-00508')
-    
-    # Leikataan Inkoon (>100 GWh) ja Haminan (>30 GWh) kapasiteettirivit pois
-    mask_cap_inkoo = is_inkoo & (df['value'] >= 100000000)
-    mask_cap_hamina = is_hamina & (df['value'] >= 30000000)
-    
-    df_real = df[~(mask_cap_inkoo | mask_cap_hamina)].copy()
-    
     # --- PÄIVÄTASON AGGREGOINTI ---
-    # Otetaan päivän maksimi, jotta oikea virtaus poimitaan (yhdistää Allocation ja Physical Flow fiksusti)
-    df_daily = df_real.groupby(['Date', 'Category', 'pointKey'], as_index=False)['value'].max()
+    # Gasgridin data on puhdasta, otetaan päivän maksimi varmistaaksemme oikean siirtosumman
+    df_daily = df.groupby(['Date', 'Category', 'pointKey'], as_index=False)['value'].max()
     
     # --- KUUKAUSITASON AGGREGOINTI ---
     df_daily['Date_Parsed'] = pd.to_datetime(df_daily['Date'])
