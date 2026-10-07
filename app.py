@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: PUHDAS PISTEPOHJAINEN HAKU OIKEALLA SUODATUKSELLA ---
+# --- 1. ENTSOG DATA: ÄLYKÄS INDIKAATTORISUODATUS ---
 
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
@@ -34,6 +34,7 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
     chunk_records = []
 
     while True:
+        # Baltian osalta Physical Flow toimii suoraan ja on nopea
         params = {
             'indicator': 'Physical Flow',
             'from': from_str,
@@ -65,23 +66,39 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_entsog_point_chunk(point_key, from_str, to_str):
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
-    params = {
-        'indicator': 'Physical Flow',
-        'from': from_str,
-        'to': to_str,
-        'limit': 5000,
-        'directionKey': 'entry',
-        'pointKey': point_key,
-        'periodType': 'day'
-    }
+    offset = 0
+    limit = 5000
+    chunk_records = []
 
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
-            return response.json().get('operationalData', [])
-    except Exception:
-        pass
-    return []
+    while True:
+        # HUOM: Suomen pisteiltä EI pyydetä pelkkää 'Physical Flow' -indikaattoria, 
+        # koska Inkoo/Hamina saattavat raportoida virtansa 'Allocation'-indikaattorilla.
+        params = {
+            'from': from_str,
+            'to': to_str,
+            'limit': limit,
+            'offset': offset,
+            'directionKey': 'entry',
+            'pointKey': point_key,
+            'periodType': 'day'
+        }
+
+        try:
+            response = requests.get(url, params=params, timeout=12)
+            if response.status_code == 200:
+                data = response.json().get('operationalData', [])
+                if not data:
+                    break
+                chunk_records.extend(data)
+                if len(data) < limit:
+                    break
+                offset += limit
+            else:
+                break
+        except Exception:
+            break
+
+    return chunk_records
 
 
 @st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (24kk)...")
@@ -98,13 +115,13 @@ def fetch_full_entsog_entry_history():
 
     all_data = []
 
-    # 1. Haetaan Baltia operaattoripohjaisesti
+    # 1. Haetaan Baltia
     for op in OPERATORS:
         for from_str, to_str in date_ranges:
             records = fetch_entsog_operator_chunk(op, from_str, to_str)
             all_data.extend(records)
 
-    # 2. Haetaan Suomen LNG-terminaalit pistekoodeilla
+    # 2. Haetaan Suomen LNG-terminaalit
     for point_key in FINLAND_POINTS:
         for from_str, to_str in date_ranges:
             records = fetch_entsog_point_chunk(point_key, from_str, to_str)
@@ -121,17 +138,13 @@ def fetch_full_entsog_entry_history():
         if 'directionKey' in df.columns:
             df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-        # --- RATKAISEVA KORJAUS: POISTETAAN KAPASITEETIT, JOTKA INFLATOIVAT LUVUT ---
-        # ENTSOG rajapinta palauttaa Inkoon kohdalla maksimikapasiteetin ja nominaatiot, jotka 
-        # sotkevat lukemat 7 TWh -tasolle, jos niitä ei nimenomaisesti suodateta pois. 
-        # Emme voi kuitenkaan vaatia pelkkää "Physical flow" -termiä, koska Suomen operaattori käyttää "Allocated Quantity".
+        # --- RATKAISU: Sallitaan sekä Physical Flow ETTÄ Allocation ---
+        # Tämä karsii pois Inkoon kapasiteettiluvut (Firm Technical Capacity), 
+        # mutta jättää todellisen virran riippumatta siitä kumpaa termiä satamaan käytetään.
         if 'indicator' in df.columns:
-            ind = df['indicator'].astype(str).str.lower()
-            # Hylätään välittömästi kaikki kapasiteettiin, ennusteisiin tai varauksiin liittyvä
-            mask = ~ind.str.contains('capacity|firm|interruptible|nomination|booking|forecast')
-            df = df[mask]
+            valid_inds = ['physical flow', 'allocation']
+            df = df[df['indicator'].astype(str).str.lower().isin(valid_inds)]
 
-        # Varmistetaan, että otetaan vain päiväkohtaiset kWh/d arvot
         unit_col = next((c for c in ['unitKey', 'unit'] if c in df.columns), None)
         if unit_col:
             df = df[df[unit_col].astype(str).str.lower().str.contains('kwh/d|energy')]
@@ -140,8 +153,7 @@ def fetch_full_entsog_entry_history():
         if date_col_raw:
             df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
             
-            # Ryhmitellään ja otetaan maksimi/summa per piste ja päivä. 
-            # Koska kapasiteetti on nyt suodatettu pois, max() poimii turvallisesti oikean virtauman.
+            # Ryhmitellään ja otetaan maksimi/summa per piste ja päivä, jotta mahdolliset duplikaatit poistuvat
             df = df.groupby(['pointKey', 'Clean_Date'], as_index=False).agg({
                 'value': 'max',
                 'pointLabel': 'first',
