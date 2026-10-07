@@ -14,7 +14,17 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: SALAMAHAKU JA ÄLYKÄS SUODATUS ---
+# --- 1. ENTSOG DATA: OPTIMOITU HAKU ---
+
+OPERATORS = [
+    'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
+    'LT-TSO-0001', # Amber Grid (Klaipėda, GIPL)
+]
+
+FINLAND_POINTS = [
+    'ITP-00495', # Inkoo FSRU
+    'ITP-00508', # Hamina LNG
+]
 
 def get_category(row):
     pk = str(row.get('pointKey', '')).upper()
@@ -31,8 +41,8 @@ def get_category(row):
         return 'GIPL (Poland -> LT)'
     return None
 
-@st.cache_data(ttl=86400, show_spinner="Noudetaan FinBalt gas entry -historiaa (kestää 2-4 sekuntia)...")
-def fetch_full_entsog_entry_history():
+@st.cache_data(ttl=86400, show_spinner="Noudetaan dataa ENTSOGista (kestää noin 5 sekuntia)...")
+def fetch_entsog_data():
     today = datetime.today()
     start_dt = (today.replace(day=1) - timedelta(days=24 * 31)).replace(day=1)
     
@@ -42,82 +52,59 @@ def fetch_full_entsog_entry_history():
     all_data = []
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
     
-    # Käytetään Sessionia API-kutsujen nopeuttamiseksi
+    # Käytetään Sessionia, joka pitää yhteyden auki ja tekee hausta salamannopean
     with requests.Session() as s:
-        def fetch(params):
+        def fetch_api(params):
             offset = 0
             params['limit'] = 5000
             while True:
                 params['offset'] = offset
                 try:
-                    resp = s.get(url, params=params, timeout=12)
-                    if resp.status_code == 200:
-                        data = resp.json().get('operationalData', [])
-                        if not data: break
-                        all_data.extend(data)
-                        if len(data) < 5000: break
+                    r = s.get(url, params=params, timeout=12)
+                    if r.status_code == 200:
+                        d = r.json().get('operationalData', [])
+                        if not d: break
+                        all_data.extend(d)
+                        if len(d) < 5000: break
                         offset += 5000
                     else:
                         break
                 except Exception:
                     break
 
-        # 1. Baltia (Conexus & Amber Grid) - Vain 2 kutsua
-        for op in ['LV-TSO-0001', 'LT-TSO-0001']:
-            fetch({
+        # 1. Baltia: Vain Physical Flow riittää
+        for op in OPERATORS:
+            fetch_api({
                 'indicator': 'Physical Flow', 'from': from_str, 'to': to_str,
                 'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
             })
         
-        # 2. Suomi (Inkoo & Hamina) - Vain 1 yhdistetty kutsu
-        # Haemme vain Physical Flow, sillä Allocation sisältää haamunollia.
-        fetch({
-            'indicator': 'Physical Flow', 'from': from_str, 'to': to_str,
-            'directionKey': 'entry', 'pointKey': 'ITP-00495,ITP-00508', 'periodType': 'day'
-        })
+        # 2. Suomi: Haetaan varmuuden vuoksi kaikki 3, jotta UI:ssa voi vaihtaa!
+        for ind in ['Allocation', 'Nomination', 'Physical Flow']:
+            fetch_api({
+                'indicator': ind, 'from': from_str, 'to': to_str,
+                'directionKey': 'entry', 'pointKey': 'ITP-00495,ITP-00508', 'periodType': 'day'
+            })
 
     df = pd.DataFrame(all_data)
     if df.empty:
         return df
 
-    # Varmistetaan luvut
+    # Varmistetaan sarakkeet
+    if 'indicator' not in df.columns: df['indicator'] = ''
+
+    # PUHDISTUS: Ei enää koskaan kerrota mitään 24:llä! ENTSOG summaa päivän valmiiksi.
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
-    
-    # Yksikkökorjaus (Jos Suomi raportoi kWh/h, skaalataan se päivävirraksi)
-    if 'unit' in df.columns:
-        df['unit_low'] = df['unit'].astype(str).str.lower()
-        hourly_mask = df['unit_low'].str.contains('kwh/h')
-        df.loc[hourly_mask, 'value'] = df.loc[hourly_mask, 'value'] * 24
+    df = df[df['periodType'].astype(str).str.lower() == 'day']
+    df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-    # Perussuodatukset
-    if 'periodType' in df.columns:
-        df = df[df['periodType'].astype(str).str.lower() == 'day']
-    if 'directionKey' in df.columns:
-        df = df[df['directionKey'].astype(str).str.lower() == 'entry']
-
-    # Poimitaan päivämäärä
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     
-    # Luokitellaan maantieteellisesti
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- LOPULLINEN RATKAISU: ÄLYKÄS DATA-SPLIT ---
-    
-    # 1. Suomen luvut (Inkoo & Hamina)
-    # Suomen rajapinta palauttaa samaan aikaan todellisen virran (esim. 16 GWh tai 0 GWh) JA maksimikapasiteetin (140 GWh).
-    # Ottamalla MINIMIN, kapasiteettihuijaus ohitetaan täydellisesti ja käteen jää aito virtaus!
-    df_fin = df[df['Category'] == 'Inkoo & Hamina LNG'].groupby(['Category', 'pointKey', 'Date'], as_index=False)['value'].min()
-    
-    # 2. Baltian luvut (Klaipeda, GIPL, Incukalns)
-    # Baltia raportoi datansa puhtaasti. Ottamalla MAKSIMIN vältämme mahdolliset 'haamunollat', joita heidän järjestelmänsä joskus syöttää.
-    df_balt = df[df['Category'] != 'Inkoo & Hamina LNG'].groupby(['Category', 'pointKey', 'Date'], as_index=False)['value'].max()
-    
-    # Yhdistetään puhtaat datat
-    df_clean = pd.concat([df_fin, df_balt], ignore_index=True)
-
-    return df_clean
+    return df
 
 
 # --- 2. KÄYTTÖLIITTYMÄ (STREAMLIT UI) ---
@@ -125,24 +112,49 @@ def fetch_full_entsog_entry_history():
 st.title("🔥 FinBalt Natural Gas Entry Flows")
 st.markdown("Monthly gas supply volumes into the Finnish-Baltic regional gas market (TWh/month). Data source: **ENTSOG Transparency Platform**.")
 
+# --- SIVUPALKKI JA ASETUKSET ---
 st.sidebar.header("Settings")
 months_to_show = st.sidebar.slider("Select time period (months):", min_value=3, max_value=24, value=12, step=1)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🇫🇮 Suomen datan hienosäätö")
+st.sidebar.markdown("*ENTSOGin rajapinnassa Inkoon Physical Flow sisältää usein virheellisesti terminaalin maksimikapasiteetin. Vaihda indikaattoria alta, jos luvut ovat liian suuria.*")
+
+# Nerokas ratkaisu: Käyttäjä saa itse ohittaa rajapinnan virheet valitsemalla toisen indikaattorin lennosta!
+fin_indicator = st.sidebar.selectbox(
+    "Valitse Suomen LNG-terminaalien datalähde:",
+    ['Allocation', 'Nomination', 'Physical Flow'],
+    index=0 # Oletuksena Allocation (luotettavin totuus virrasta)
+)
 
 if st.sidebar.button("Clear Cache & Refresh 🔄"):
     st.cache_data.clear()
     st.rerun()
 
-df_raw = fetch_full_entsog_entry_history()
+# --- DATAN KÄSITTELY VALINNAN MUKAAN ---
+df_raw = fetch_entsog_data()
 
 if df_raw.empty:
     st.warning("Ei saatu yhteyttä ENTSOG API-rajapintaan tai data on tyhjä. Napsauta 'Clear Cache & Refresh'.")
 else:
-    df_filtered = df_raw.copy()
-    df_filtered['Date_Parsed'] = pd.to_datetime(df_filtered['Date'], utc=True)
-    df_filtered['Month'] = df_filtered['Date_Parsed'].dt.strftime('%Y-%m')
+    # 1. Suodatetaan Baltian data (Aina Physical Flow)
+    df_balt = df_raw[(df_raw['Category'] != 'Inkoo & Hamina LNG') & (df_raw['indicator'].astype(str).str.lower() == 'physical flow')]
+    
+    # 2. Suodatetaan Suomen data UI-valikon mukaan
+    df_fin = df_raw[(df_raw['Category'] == 'Inkoo & Hamina LNG') & (df_raw['indicator'].astype(str).str.lower() == fin_indicator.lower())]
+    
+    # Yhdistetään
+    df_filtered = pd.concat([df_balt, df_fin])
+    
+    # Karsitaan päällekkäisyydet (esim. jos kaksi operaattoria ilmoittaa saman tiedon)
+    # Otetaan päivän MAKSIMI, jottei todellinen virta huku, jos toinen operaattori ilmoittaa vahingossa 0.
+    df_clean = df_filtered.groupby(['Category', 'pointKey', 'Date'], as_index=False)['value'].max()
+
+    df_clean['Date_Parsed'] = pd.to_datetime(df_clean['Date'], utc=True)
+    df_clean['Month'] = df_clean['Date_Parsed'].dt.strftime('%Y-%m')
 
     # Aggregointi kuukausitasolle (kWh -> TWh muunnos: / 1e9)
-    monthly_summary = df_filtered.groupby(['Month', 'Category'])['value'].sum().reset_index()
+    monthly_summary = df_clean.groupby(['Month', 'Category'])['value'].sum().reset_index()
     monthly_summary['Value_TWh'] = monthly_summary['value'] / 1e9
 
     pivot_df = monthly_summary.pivot(index='Month', columns='Category', values='Value_TWh').fillna(0)
