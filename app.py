@@ -17,9 +17,9 @@ st.set_page_config(
 # --- 1. ENTSOG DATA: NOPEA JA LUOTETTAVA HAKU ---
 
 OPERATORS = [
-    'FI-TSO-0001', # Gasgrid Finland (Inkoo, Hamina)
-    'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
-    'LT-TSO-0001', # Amber Grid (Klaipėda, GIPL)
+    'FI-TSO-0001', # Gasgrid Finland
+    'LV-TSO-0001', # Conexus Baltic Grid
+    'LT-TSO-0001', # Amber Grid
 ]
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -83,33 +83,29 @@ def fetch_full_entsog_entry_history():
 
 def classify_entry_flow(row):
     """
-    Luokittelee syöttövirrat kategorioihin tarkan nimentän ja operaattorin perusteella.
+    Laajennettu tunnistuslogiikka varmistaa, että Inkoo, Hamina, Klaipėda ja Inčukalns tarttuvat varmasti.
     """
     point_label = str(row.get('pointLabel', '')).lower()
     operator_key = str(row.get('operatorKey', '')).upper()
     operator_label = str(row.get('operatorLabel', '')).lower()
     combined = f"{point_label} {operator_label}"
 
-    # 1. Suomen maahantuonti (Gasgrid FI-TSO-0001): Kaikki Suomeen tuleva entry on LNG:tä (Inkoo / Hamina)
-    if operator_key == 'FI-TSO-0001':
-        return 'Inkoo & Hamina LNG'
-
-    # 2. Inčukalns-varasto (Latvia)
+    # 1. Inčukalns-varasto (Latvia)
     if 'incukalns' in combined or 'inčukalns' in combined:
         return 'Inčukalns UGS (Withdrawal)'
 
-    # 3. Klaipėda LNG (Liettua)
-    if 'klaip' in combined or 'independence' in combined or 'kn' in combined or 'lng' in combined:
-        if operator_key == 'LT-TSO-0001' and not ('gipl' in combined or 'santaka' in combined or 'latvia' in combined or 'belarus' in combined):
+    # 2. Klaipėda LNG (Liettua)
+    if 'klaip' in combined or 'independence' in combined or 'kn' in combined:
+        if not ('gipl' in combined or 'santaka' in combined):
             return 'Klaipėda LNG'
 
-    # 4. GIPL (Puola -> Liettua)
+    # 3. GIPL (Puola -> Liettua)
     if 'gipl' in combined or 'santaka' in combined or 'poland' in combined:
         return 'GIPL (Poland -> LT)'
-        
-    # Yleistunnistus Liettuan Amber Gridin muille mahdollisille LNG-merkinnöille jos yllä olevat eivät osu
-    if operator_key == 'LT-TSO-0001' and ('klaipeda' in combined or 'klaipėda' in combined):
-        return 'Klaipėda LNG'
+
+    # 4. Inkoo & Hamina LNG (Suomi / Gasgrid tai yleiset Suomen maahantuontipisteet)
+    if operator_key == 'FI-TSO-0001' or 'inkoo' in combined or 'hamina' in combined or 'finland' in combined or 'fsru' in combined:
+        return 'Inkoo & Hamina LNG'
 
     return None
 
@@ -132,6 +128,12 @@ df_raw = fetch_full_entsog_entry_history()
 if df_raw.empty:
     st.warning("Ei saatu yhteyttä ENTSOG API-rajapintaan. Napsauta 'Clear Cache & Refresh'.")
 else:
+    # Lisätään väliaikainen debug-tarkistus, jotta näemme mitä pisteitä Suomelta (FI-TSO-0001) tulee
+    fi_data = df_raw[df_raw['operatorKey'] == 'FI-TSO-0001']
+    if not fi_data.empty:
+        unique_points = fi_data['pointLabel'].unique()
+        st.sidebar.info(f"Löydetyt Suomen pisteet: {', '.join(str(p) for p in unique_points)}")
+
     df_raw['Category'] = df_raw.apply(classify_entry_flow, axis=1)
     df_filtered = df_raw.dropna(subset=['Category']).copy()
 
@@ -222,5 +224,5 @@ else:
             label="Download Data as CSV 📥",
             data=csv_data,
             file_name=f"finbalt_gas_entry_flows_{latest_month}.csv",
-            mime="text/csv"
+            mime="text/css"
         )
