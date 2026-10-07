@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: KOHDENNETTU JA OIKEIN SKAALAUTUVA HAKU ---
+# --- 1. ENTSOG DATA: NOPEA JA PUHDISTETTU HAKU ---
 
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
@@ -104,7 +104,7 @@ def fetch_full_entsog_entry_history():
             records = fetch_entsog_operator_chunk(op, from_str, to_str)
             all_data.extend(records)
 
-    # 2. Haetaan Inkoo ja Hamina puhtaasti pistekoodeilla
+    # 2. Haetaan Inkoo ja Hamina pistekoodeilla
     for point_key in FINLAND_POINTS:
         for from_str, to_str in date_ranges:
             records = fetch_entsog_point_chunk(point_key, from_str, to_str)
@@ -112,15 +112,15 @@ def fetch_full_entsog_entry_history():
 
     df = pd.DataFrame(all_data)
     
-    # Tiukka puhdistus ja duplikaattien esto: varmistetaan, että samaa päivää ei lasketa kahteen kertaan
+    # --- KRITTINEN KORJAUS: POISTETAAN PÄIVÄKOHTAISET DUPLIKAATIT (ESTÄÄ MONINKERTAISTUMISEN) ---
     if not df.empty:
-        if 'periodType' in df.columns:
-            df = df[df['periodType'].astype(str).str.lower() == 'day']
-        
-        # Poistetaan kaksoiskappaleet pointKeyn ja alkupäivän mukaan
-        subset_cols = [c for c in ['pointKey', 'periodFrom', 'directionKey'] if c in df.columns]
-        if subset_cols:
-            df = df.drop_duplicates(subset=subset_cols, keep='first')
+        date_col_raw = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
+        if date_col_raw:
+            df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
+            df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
+            
+            # Pidetään per piste ja päivä vain yksi rivi (suurin arvo tai ensimmäinen), estää versionumeroiden kertaantumisen
+            df = df.sort_values('value', ascending=False).drop_duplicates(subset=['pointKey', 'Clean_Date'], keep='first')
 
     return df
 
