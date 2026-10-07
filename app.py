@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: TARKASTI RAJATTU JA PUHDISTETTU HAKU ---
+# --- 1. ENTSOG DATA: TARKKAKÄYTÖKSINEEN JA VERSIOSUODATUKSELLA ---
 
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
@@ -112,7 +112,7 @@ def fetch_full_entsog_entry_history():
 
     df = pd.DataFrame(all_data)
     
-    # --- TIUKKA PUHDISTUS JA DUPLIKAATTIEN POISTO ---
+    # --- KRITTINEN PUHDISTUS: POISTETAAN ENTSOG:N VERSIO- JA STATUSMONISTUKSET ---
     if not df.empty:
         if 'periodType' in df.columns:
             df = df[df['periodType'].astype(str).str.lower() == 'day']
@@ -120,13 +120,23 @@ def fetch_full_entsog_entry_history():
         if 'directionKey' in df.columns:
             df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
+        # Jos statusKey löytyy, suositaan 'Actual'-tilaa
+        if 'statusKey' in df.columns:
+            actual_df = df[df['statusKey'].astype(str).str.lower() == 'actual']
+            if not actual_df.empty:
+                df = actual_df
+
+        # Muunnetaan versio numeroksi ja lajitellaan uusimman mukaan
+        if 'version' in df.columns:
+            df['version'] = pd.to_numeric(df['version'], errors='coerce').fillna(0)
+            df = df.sort_values('version', ascending=False)
+
         date_col_raw = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
         if date_col_raw:
             df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
             df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
             
-            # Ryhmitellään ja otetaan vain yksi, oikea mittaustietue per piste ja päivä (esim. summaamalla tai ottamalla keskiarvo / max)
-            # Koska kyseessä on sama fyysinen virta, otetaan maksimi tai summa, mutta otetaan tarkka drop_duplicates
+            # Pidetään tasan yksi rivi per piste ja päivä (version mukaan suurimmasta/uusimmasta alkaen)
             df = df.drop_duplicates(subset=['pointKey', 'Clean_Date'], keep='first')
 
     return df
