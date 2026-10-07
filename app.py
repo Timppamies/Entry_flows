@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: PÄIVÄKOHTAINEN AGGREGONTI JA DUPLIKAATTIEN ESTO ---
+# --- 1. ENTSOG DATA: TÄYDELLINEN PISTEKOHTAINEN UNIKOINTI ---
 
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
@@ -112,7 +112,7 @@ def fetch_full_entsog_entry_history():
 
     df = pd.DataFrame(all_data)
     
-    # --- PUHDISTUS JA PÄIVÄKOHTAINEN UNIKOINTI ---
+    # --- ANKARIN MAHDOLLINEN PUHDISTUS JA UNIKOINTI ---
     if not df.empty:
         df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
 
@@ -122,23 +122,20 @@ def fetch_full_entsog_entry_history():
         if 'directionKey' in df.columns:
             df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-        # Poistetaan kapasiteettiin viittaavat rivit
-        for col in ['subIndicator', 'item', 'subIndicatorKey']:
-            if col in df.columns:
-                mask = ~df[col].astype(str).str.lower().str.contains('capacity|firm|interruptible|booking|nomination|allocation')
-                df = df[mask]
-
         date_col_raw = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
         if date_col_raw:
             df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
             
-            # KRITTINEN KORJAUS: Ryhmitellään pisteen ja päivän mukaan ja otetaan maksimiarvo.
-            # Tämä estää sen, että ENTSOG:n palauttamat rinnakkaiset mittaukset/versiot moninkertaistavat summan.
-            group_cols = ['pointKey', 'Clean_Date', 'pointLabel', 'operatorKey', 'operatorLabel']
-            existing_group_cols = [c for c in group_cols if c in df.columns]
-            
-            if existing_group_cols:
-                df = df.groupby(existing_group_cols, as_index=False)['value'].max()
+            # PAKOTETTU TIIVISTYS: Ryhmitellään AINOASTAAN pointKeyn ja Clean_Date mukaan.
+            # Tämä varmistaa, että vaikka rajapinta palauttaisi 15 eri versiota/riviä samalle päivälle,
+            # niistä otetaan vain yksi (suurin arvo tai keskiarvo), eikä summoida niitä vastakkain.
+            df = df.groupby(['pointKey', 'Clean_Date'], as_index=False).agg({
+                'value': 'max',
+                'pointLabel': 'first',
+                'operatorKey': 'first',
+                'operatorLabel': 'first',
+                'directionKey': 'first'
+            })
 
     return df
 
@@ -192,7 +189,6 @@ else:
     if df_filtered.empty:
         st.warning("Syöttövirtoja ei löytynyt annetulta aikaväliltä.")
     else:
-        # Muutetaan Clean_Date takaisin päivämääräksi kuukausittaista ryhmittelyä varten
         df_filtered['Date_Parsed'] = pd.to_datetime(df_filtered['Clean_Date'], utc=True)
         df_filtered['Month'] = df_filtered['Date_Parsed'].dt.strftime('%Y-%m')
 
@@ -268,5 +264,5 @@ else:
             label="Download Data as CSV 📥",
             data=csv_data,
             file_name=f"finbalt_gas_entry_flows_{latest_month}.csv",
-            mime="text/css"
+            mime="text/csv"
         )
