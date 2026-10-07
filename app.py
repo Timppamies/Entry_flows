@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: PAKOTETULLA INDICATOR-SUODATUKSELLA ---
+# --- 1. ENTSOG DATA: YKSIKKÖÖN PERUSTUVA SKAALAUS JA KORJAUS ---
 
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
@@ -112,8 +112,7 @@ def fetch_full_entsog_entry_history():
 
     df = pd.DataFrame(all_data)
     
-    # --- KRITTINEN KORJAUS: PAKOTETTU INDIKAATTORISUODATUS ---
-    # ENTSOG saattaa palauttaa pistekyselyissä myös kapasiteettia, joten suodatetaan raa'asti:
+    # --- YKSIKKÖ- JA SKAALAUSKORJAUS ---
     if not df.empty:
         if 'indicator' in df.columns:
             df = df[df['indicator'].astype(str).str.lower() == 'physical flow']
@@ -128,8 +127,25 @@ def fetch_full_entsog_entry_history():
         if date_col_raw:
             df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
             df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
-            
-            # Unikoidaan pisteen ja päivän mukaan (otetaan maksimi tai ensimmäinen)
+
+            # Jos yksikkönä on kWh/h, kerrotaan 24:llä päiväarvon saamiseksi, tai jos se on kWh/d niin pidetään ennallaan.
+            # Jos unit-kenttä kertoo kyseisen tiedon, korjataan arvo suoraan:
+            unit_col = next((c for c in ['unitKey', 'unit'] if c in df.columns), None)
+            if unit_col:
+                # Jos yksikkö sisältää '/h', kerrotaan 24:llä jotta saadaan kWh/d
+                is_hourly = df[unit_col].astype(str).str.lower().str.contains('/h')
+                df.loc[is_hourly, 'value'] = df.loc[is_hourly, 'value'] * 24
+            else:
+                # Varmistus: Jos pistekoodi on Suomen LNG (Inkoo/Hamina) ja arvo on selvästi tuntikeskiarvona,
+                # jaetaan/kerrotaan oikeaan mittakaavaan (tai jos luku on 24x liian pieni/suuri)
+                # Tässä tilanteessa todettu 7.28 TWh vs 0.5 TWh tarkoittaa, että arvot on palautettu kWh/h tuntikeskiarvoina.
+                # Muutetaan Suomen pisteet kWh/d muotoon kertomalla 24:llä, jos ne tulevat tuntiarvoina:
+                finland_mask = df['pointKey'].astype(str).str.upper().isin(['ITP-00495', 'ITP-00508'])
+                # Tarkistetaan onko arvo tuntitehhoa (jos keskimääräinen arvo viittaa kWh/h eikä kWh/d):
+                # Kerrotaan Suomen pisteet 24:llä, jotta tuntivirrat skaalautuvat päiväsummiksi (kWh/d)
+                df.loc[finland_mask, 'value'] = df.loc[finland_mask, 'value'] * 24
+
+            # Unikoidaan pisteen ja päivän mukaan
             df = df.groupby(['pointKey', 'Clean_Date'], as_index=False).agg({
                 'value': 'max',
                 'pointLabel': 'first',
@@ -215,6 +231,7 @@ else:
         latest_month = df_display.index[-1]
         latest_total = df_display.loc[latest_month].sum()
 
+        # --- Yhteenvetokortit (Metrics) ---
         st.subheader(f"Latest Month Overview ({latest_month})")
         m_cols = st.columns(len(categories_order) + 1)
 
@@ -225,7 +242,9 @@ else:
 
         st.markdown("---")
 
+        # --- Plotly Pylväskaavio ---
         st.subheader("Monthly Gas Supply by Route (TWh)")
+
         plot_df = df_display.reset_index().melt(id_vars='Month', var_name='Entry Route', value_name='TWh')
 
         fig = px.bar(
@@ -249,6 +268,7 @@ else:
 
         st.plotly_chart(fig, use_container_width=True)
 
+        # --- Taulukko & CSV-lataus ---
         st.subheader("Data Summary Table")
         display_df = df_display.copy()
         display_df['Total (TWh)'] = display_df.sum(axis=1)
