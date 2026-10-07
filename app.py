@@ -41,9 +41,8 @@ def get_category(row):
         return 'GIPL (Poland -> LT)'
     return None
 
-
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
+def fetch_entsog_operator_chunk(operator_key, from_str, to_str, indicator):
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
     offset = 0
     limit = 5000
@@ -51,7 +50,7 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
 
     while True:
         params = {
-            'indicator': 'Physical Flow',
+            'indicator': indicator,
             'from': from_str,
             'to': to_str,
             'limit': limit,
@@ -75,7 +74,7 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
     return chunk_records
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_entsog_point_chunk(point_key, from_str, to_str):
+def fetch_entsog_point_chunk(point_key, from_str, to_str, indicator):
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
     offset = 0
     limit = 5000
@@ -83,7 +82,7 @@ def fetch_entsog_point_chunk(point_key, from_str, to_str):
 
     while True:
         params = {
-            'indicator': 'Physical Flow',
+            'indicator': indicator,
             'from': from_str,
             'to': to_str,
             'limit': limit,
@@ -106,7 +105,7 @@ def fetch_entsog_point_chunk(point_key, from_str, to_str):
             break
     return chunk_records
 
-@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (tämä kestää n. 30s)...")
+@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (noin 10 sekuntia)...")
 def fetch_full_entsog_entry_history():
     today = datetime.today()
     first_day_current_month = today.replace(day=1)
@@ -120,56 +119,63 @@ def fetch_full_entsog_entry_history():
 
     all_data = []
 
+    # Baltian operaattoreille riittää 'Physical Flow'
     for op in OPERATORS:
         for from_str, to_str in date_ranges:
-            all_data.extend(fetch_entsog_operator_chunk(op, from_str, to_str))
+            all_data.extend(fetch_entsog_operator_chunk(op, from_str, to_str, 'Physical Flow'))
 
+    # Suomen pisteille haetaan myös Allocation ja Nomination, jotta oikea virta löytyy kapasiteetin sijaan
     for pk in FINLAND_POINTS:
-        for from_str, to_str in date_ranges:
-            all_data.extend(fetch_entsog_point_chunk(pk, from_str, to_str))
+        for ind in ['Allocation', 'Physical Flow', 'Nomination']:
+            for from_str, to_str in date_ranges:
+                all_data.extend(fetch_entsog_point_chunk(pk, from_str, to_str, ind))
 
     df = pd.DataFrame(all_data)
     if df.empty:
         return df
 
-    # Varmistetaan luvut
+    # Varmistetaan luvut ja päivämäärät
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
     
-    # Perussuodatus
     if 'periodType' in df.columns:
         df = df[df['periodType'].astype(str).str.lower() == 'day']
     if 'directionKey' in df.columns:
         df = df[df['directionKey'].astype(str).str.lower() == 'entry']
-    if 'indicator' in df.columns:
-        df = df[df['indicator'].astype(str).str.lower() == 'physical flow']
 
-    # Poimitaan päivämäärä
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     
-    # Luokitellaan maantieteellisesti
+    # Luokitellaan kategoriat
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- TÄYDELLINEN DUPLIKAATTIEN PURKU ILMAN MAX() FUNKTIOTA ---
-    def pick_true_physical_flow(group):
-        valid = group[group['value'] > 0]
-        if valid.empty:
-            return group.iloc[0] # Vain nollia tarjolla
+    # --- ÄLYKÄS DUPLIKAATTIEN PURKU (Ohittaa ENTSOGin kapasiteettivirheet) ---
+    def pick_best_flow(group):
+        # 1. Priorisoidaan "Allocation" -tieto (Allokoitu todellinen virta)
+        alloc = group[group['indicator'].astype(str).str.lower() == 'allocation']
+        if not alloc.empty:
+            # Otetaan mieluiten kantaverkkoyhtiön (Gasgrid) lukema
+            tso = alloc[alloc['operatorKey'].astype(str).str.upper() == 'FI-TSO-0001']
+            if not tso.empty:
+                return tso.loc[tso['value'].idxmax()]
+            return alloc.loc[alloc['value'].idxmax()]
             
-        # 1. Jos datassa on 'Actual'-status, se on kaikkein todennäköisimmin toteutuma
-        if 'statusKey' in valid.columns:
-            actuals = valid[valid['statusKey'].astype(str).str.lower() == 'actual']
-            if not actuals.empty:
-                # Otetaan Actual-riveistä pienin arvo varmuuden vuoksi
-                return actuals.loc[actuals['value'].idxmin()]
-                
-        # 2. Jos statusta ei ole, ohitetaan sokeasti valtavat 140 GWh kapasiteettihäiriöt
-        # ottamalla päivän pienin nollasta poikkeava arvo. 
-        return valid.loc[valid['value'].idxmin()]
+        # 2. Jos Allokaatiota ei ole, tarkistetaan "Physical Flow"
+        phys = group[group['indicator'].astype(str).str.lower() == 'physical flow']
+        if not phys.empty:
+            # Koska LNG-operaattori voi raportoida tähän maksimikapasiteettinsa (140 GWh),
+            # valitsemme PIENIMMÄN arvon, joka kuvastaa todellista virtaa.
+            return phys.loc[phys['value'].idxmin()]
+            
+        # 3. Viimeisenä oljenkortena "Nomination"
+        nom = group[group['indicator'].astype(str).str.lower() == 'nomination']
+        if not nom.empty:
+            return nom.loc[nom['value'].idxmin()]
+            
+        return group.iloc[0]
 
-    # Ajetaan suodatus per kategoria, piste ja päivä
-    df_clean = df.groupby(['Category', 'pointKey', 'Date'], as_index=False).apply(pick_true_physical_flow).reset_index(drop=True)
+    # Ajetaan suodatus pisteen ja päivän mukaan
+    df_clean = df.groupby(['Category', 'pointKey', 'Date'], as_index=False).apply(pick_best_flow).reset_index(drop=True)
 
     return df_clean
 
