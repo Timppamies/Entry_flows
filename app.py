@@ -14,20 +14,13 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: NOPEA JA VAKAA HAKU ---
-
-OPERATORS = [
-    'LV-TSO-0001', # Conexus Baltic Grid
-    'LT-TSO-0001', # Amber Grid
-    'FI-TSO-0001'  # Gasgrid Finland (Suomen virallinen siirtoverkko)
-]
+# --- 1. ENTSOG DATA: BALTIA KOSKEMATON + SUOMEN ERILLISHAKU ---
 
 def get_category(row):
     pk = str(row.get('pointKey', '')).upper()
     pl = str(row.get('pointLabel', '')).lower()
     op = str(row.get('operatorKey', '')).upper()
     
-    # Suomen kantaverkon (Gasgrid) pisteet
     if op == 'FI-TSO-0001':
         return 'Inkoo & Hamina LNG'
     if 'incukalns' in pl or 'inčukalns' in pl:
@@ -47,7 +40,6 @@ def fetch_fast_entsog_data():
     from_str = start_dt.strftime('%Y-%m-%d')
     to_str = today.strftime('%Y-%m-%d')
     
-    # Jaetaan kysely kahteen osaan API-vakauden varmistamiseksi
     date_ranges = [
         (from_str, (start_dt + timedelta(days=365)).strftime('%Y-%m-%d')),
         (((start_dt + timedelta(days=365+1)).strftime('%Y-%m-%d')), to_str)
@@ -76,8 +68,8 @@ def fetch_fast_entsog_data():
                     break
 
         for d_start, d_end in date_ranges:
-            # Haetaan kantaverkkoyhtiöiden (Baltia + Suomi) datat suoraan operaattoreittain
-            for op in OPERATORS:
+            # 1. BALTIA: Koskematon ja täsmälleen alkuperäinen toimiva haku
+            for op in ['LV-TSO-0001', 'LT-TSO-0001']:
                 fetch_api({
                     'indicator': 'Physical Flow', 
                     'from': d_start, 
@@ -86,6 +78,16 @@ def fetch_fast_entsog_data():
                     'operatorKey': op, 
                     'periodType': 'day'
                 })
+            
+            # 2. SUOMI: Haetaan erikseen Allocation-indikaattorilla, sillä Gasgrid käyttää sitä
+            fetch_api({
+                'indicator': 'Allocation', 
+                'from': d_start, 
+                'to': d_end,
+                'directionKey': 'entry', 
+                'operatorKey': 'FI-TSO-0001', 
+                'periodType': 'day'
+            })
 
     df = pd.DataFrame(all_data)
     return df
@@ -115,26 +117,17 @@ else:
     df = df[df['periodType'].astype(str).str.lower() == 'day']
     df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-    # --- TÄRKEÄ KORJAUS 1: YKSIKKÖSKAALAUS SUOMELLE ---
-    # Gasgrid ilmoittaa Suomen luvut poikkeuksellisesti tuntitehona (kWh/h), kerrotaan 24:llä päiväenergiaksi
-    if 'unit' in df.columns:
-        df['unit_low'] = df['unit'].astype(str).str.lower()
-        is_finland_hourly = (df['operatorKey'].astype(str).str.upper() == 'FI-TSO-0001') & df['unit_low'].str.contains('kwh/h')
-        df.loc[is_finland_hourly, 'value'] = df.loc[is_finland_hourly, 'value'] * 24
-
     # Kategoriat ja päivämäärät
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- TÄRKEÄ KORJAUS 2: KAPASITEETTILEIKKURI SUOMELLE ---
-    # Poistetaan Gasgridin mahdolliset Inkoon yli 120 GWh kapasiteettirivit
+    # --- KAPASITEETTILEIKKURI SUOMELLE (Suodattaa mahdolliset kapasiteettipiikit pois) ---
     is_finland = df['Category'] == 'Inkoo & Hamina LNG'
     df.loc[is_finland & (df['value'] > 120000000), 'value'] = 0.0
 
     # --- PÄIVÄTASON AGGREGOINTI ---
-    # Otetaan päivän maksimi, jotta oikea virtaus poimitaan
     df_daily = df.groupby(['Date', 'Category', 'pointKey'], as_index=False)['value'].max()
     
     # --- KUUKAUSITASON AGGREGOINTI ---
