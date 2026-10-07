@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: TÄYDELLINEN PISTEKOHTAINEN UNIKOINTI ---
+# --- 1. ENTSOG DATA: PAKOTETULLA INDICATOR-SUODATUKSELLA ---
 
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
@@ -112,9 +112,11 @@ def fetch_full_entsog_entry_history():
 
     df = pd.DataFrame(all_data)
     
-    # --- ANKARIN MAHDOLLINEN PUHDISTUS JA UNIKOINTI ---
+    # --- KRITTINEN KORJAUS: PAKOTETTU INDIKAATTORISUODATUS ---
+    # ENTSOG saattaa palauttaa pistekyselyissä myös kapasiteettia, joten suodatetaan raa'asti:
     if not df.empty:
-        df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
+        if 'indicator' in df.columns:
+            df = df[df['indicator'].astype(str).str.lower() == 'physical flow']
 
         if 'periodType' in df.columns:
             df = df[df['periodType'].astype(str).str.lower() == 'day']
@@ -125,10 +127,9 @@ def fetch_full_entsog_entry_history():
         date_col_raw = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
         if date_col_raw:
             df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
+            df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
             
-            # PAKOTETTU TIIVISTYS: Ryhmitellään AINOASTAAN pointKeyn ja Clean_Date mukaan.
-            # Tämä varmistaa, että vaikka rajapinta palauttaisi 15 eri versiota/riviä samalle päivälle,
-            # niistä otetaan vain yksi (suurin arvo tai keskiarvo), eikä summoida niitä vastakkain.
+            # Unikoidaan pisteen ja päivän mukaan (otetaan maksimi tai ensimmäinen)
             df = df.groupby(['pointKey', 'Clean_Date'], as_index=False).agg({
                 'value': 'max',
                 'pointLabel': 'first',
@@ -192,7 +193,6 @@ else:
         df_filtered['Date_Parsed'] = pd.to_datetime(df_filtered['Clean_Date'], utc=True)
         df_filtered['Month'] = df_filtered['Date_Parsed'].dt.strftime('%Y-%m')
 
-        # Aggregointi kuukausitasolle (kWh -> TWh muunnos: / 1e9)
         monthly_summary = df_filtered.groupby(['Month', 'Category'])['value'].sum().reset_index()
         monthly_summary['Value_TWh'] = monthly_summary['value'] / 1e9
 
@@ -215,7 +215,6 @@ else:
         latest_month = df_display.index[-1]
         latest_total = df_display.loc[latest_month].sum()
 
-        # --- Yhteenvetokortit (Metrics) ---
         st.subheader(f"Latest Month Overview ({latest_month})")
         m_cols = st.columns(len(categories_order) + 1)
 
@@ -226,9 +225,7 @@ else:
 
         st.markdown("---")
 
-        # --- Plotly Pylväskaavio ---
         st.subheader("Monthly Gas Supply by Route (TWh)")
-
         plot_df = df_display.reset_index().melt(id_vars='Month', var_name='Entry Route', value_name='TWh')
 
         fig = px.bar(
@@ -252,7 +249,6 @@ else:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Taulukko & CSV-lataus ---
         st.subheader("Data Summary Table")
         display_df = df_display.copy()
         display_df['Total (TWh)'] = display_df.sum(axis=1)
