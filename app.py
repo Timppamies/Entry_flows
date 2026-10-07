@@ -115,36 +115,26 @@ def fetch_full_entsog_entry_history():
     if not df.empty:
         df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
 
+        # --- KRITTINEN KORJAUS: Suodatetaan armottomasti kaikki muut paitsi todellinen Physical Flow ---
+        # ENTSOG palauttaa Inkoon kohdalla pointKey-haulla myös kapasiteetin (joka moninkertaistaa luvut), 
+        # ellei indikaattoria suodateta pakotetusti datakehyksestä:
+        if 'indicator' in df.columns:
+            df = df[df['indicator'].astype(str).str.strip().str.lower() == 'physical flow']
+
         if 'periodType' in df.columns:
             df = df[df['periodType'].astype(str).str.lower() == 'day']
             
         if 'directionKey' in df.columns:
             df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-        # Varmistetaan, että otetaan vain päiväkohtaiset kWh/d arvot ja poistetaan duplikaatit
-        unit_col = next((c for c in ['unitKey', 'unit'] if c in df.columns), None)
-        if unit_col:
-            df = df[df[unit_col].astype(str).str.lower().str.contains('kwh/d|energy')]
-
-        # Suodatetaan pois mahdolliset alustavat niminaatiot, jos sarakkeessa on tietoa tyypistä
-        type_col = next((c for c in ['subIndicator', 'item', 'subIndicatorKey'] if c in df.columns), None)
-        if type_col:
-            # Pidetään mukana allokaatiot, mitatut tai tyhjät (jos kenttää ei ole rajattu tarkemmin)
-            valid_mask = df[type_col].astype(str).str.lower().str.contains('allocate|measure|actual|def') | (df[type_col].astype(str) == 'nan')
-            df = df[valid_mask]
-
+        # Etsitään päivämääräsarake
         date_col_raw = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
         if date_col_raw:
             df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
             
-            # Ryhmitellään ja otetaan maksimi/summa per piste ja päivä, jotta duplikaatit poistuvat varmasti
-            df = df.groupby(['pointKey', 'Clean_Date'], as_index=False).agg({
-                'value': 'max',
-                'pointLabel': 'first',
-                'operatorKey': 'first',
-                'operatorLabel': 'first',
-                'directionKey': 'first'
-            })
+            # Poistetaan duplikaatit (jos sama fyysinen virta ilmoitetaan esim. terminaalin ja Gasgridin toimesta)
+            # Pidetään vain yksi puhdas fyysinen mittaus per piste ja päivä, vältetään summauksia tai maksimien poimintoja
+            df = df.drop_duplicates(subset=['pointKey', 'Clean_Date'], keep='first')
 
     return df
 
