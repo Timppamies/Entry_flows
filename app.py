@@ -14,7 +14,17 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: YKSIKKÖKORJATTU SALAMAHAKU ---
+# --- 1. ENTSOG DATA: OPTIMOITU SALAMAHAKU ---
+
+OPERATORS = [
+    'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
+    'LT-TSO-0001', # Amber Grid (Klaipėda, GIPL)
+]
+
+FINLAND_POINTS = [
+    'ITP-00495', # Inkoo FSRU
+    'ITP-00508', # Hamina LNG
+]
 
 def get_category(row):
     pk = str(row.get('pointKey', '')).upper()
@@ -31,7 +41,7 @@ def get_category(row):
         return 'GIPL (Poland -> LT)'
     return None
 
-@st.cache_data(ttl=86400, show_spinner="Haetaan FinBalt gas entry -historiaa (kestää noin 10–15 sekuntia)...")
+@st.cache_data(ttl=86400, show_spinner="Haetaan ja puhdistetaan rajapintadataa (kestää noin 5-10 sekuntia)...")
 def fetch_full_entsog_entry_history():
     today = datetime.today()
     start_dt = (today.replace(day=1) - timedelta(days=24 * 31)).replace(day=1)
@@ -39,6 +49,7 @@ def fetch_full_entsog_entry_history():
     from_str = start_dt.strftime('%Y-%m-%d')
     to_str = today.strftime('%Y-%m-%d')
     
+    # Jaetaan 2 vuoden aikaväli kahteen osaan API-vakautta varten
     date_ranges = [
         (from_str, (start_dt + timedelta(days=365)).strftime('%Y-%m-%d')),
         (((start_dt + timedelta(days=365+1)).strftime('%Y-%m-%d')), to_str)
@@ -52,29 +63,33 @@ def fetch_full_entsog_entry_history():
         try:
             resp = session.get(url, params=params, timeout=12)
             if resp.status_code == 200:
-                all_data.extend(resp.json().get('operationalData', []))
+                data = resp.json().get('operationalData', [])
+                if data:
+                    all_data.extend(data)
         except Exception:
             pass
 
     for d_start, d_end in date_ranges:
-        # 1. Baltia (Conexus & Amber Grid)
-        for op in ['LV-TSO-0001', 'LT-TSO-0001']:
+        # 1. Baltia: 'Physical Flow' on luotettava
+        for op in OPERATORS:
             fetch({
                 'indicator': 'Physical Flow', 'from': d_start, 'to': d_end,
                 'limit': 5000, 'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
             })
         
-        # 2. Suomi (Inkoo ja Hamina)
-        fetch({
-            'from': d_start, 'to': d_end,
-            'limit': 5000, 'directionKey': 'entry', 'pointKey': 'ITP-00495,ITP-00508', 'periodType': 'day'
-        })
+        # 2. Suomi: Haetaan SEKÄ Allocation ETTÄ Physical Flow
+        for pk in FINLAND_POINTS:
+            for ind in ['Allocation', 'Physical Flow']:
+                fetch({
+                    'indicator': ind, 'from': d_start, 'to': d_end,
+                    'limit': 5000, 'directionKey': 'entry', 'pointKey': pk, 'periodType': 'day'
+                })
 
     df = pd.DataFrame(all_data)
     if df.empty:
         return df
 
-    # Varmistetaan sarakkeiden olemassaolo
+    # Varmistetaan sarakkeet
     for col in ['unit', 'operatorKey', 'statusKey', 'indicator']:
         if col not in df.columns:
             df[col] = ''
@@ -84,33 +99,42 @@ def fetch_full_entsog_entry_history():
     df = df[df['periodType'].astype(str).str.lower() == 'day']
     df = df[df['directionKey'].astype(str).str.lower() == 'entry']
     
-    # --- KRITIIKKI KORJAUS 1: YKSIKÖT JA SKAALAUS ---
-    # Sallitaan sekä päivä- että tuntitehot, sillä Suomi raportoi usein tuntitehona
+    # Yksiköt ja skaalaus (muutetaan kWh/h -> kWh/d)
     df['unit_low'] = df['unit'].astype(str).str.lower()
     df = df[df['unit_low'].str.contains('kwh/d|kwh/h')]
     
-    # Kerrotaan tuntitehot 24:llä, jotta ne ovat vertailukelpoisia
     is_hourly = df['unit_low'].str.contains('kwh/h')
     df.loc[is_hourly, 'value'] = df.loc[is_hourly, 'value'] * 24
 
-    # --- KRITIIKKI KORJAUS 2: INDIKAATTORIN PUHDISTUS ---
-    # Pakotetaan data olemaan joko 'Physical Flow' tai 'Allocation'. 
-    # Tämä tuhoaa välittömästi 'Firm Technical Capacity' -rivit, jotka olivat 6 TWh haamulukujen takana.
-    valid_indicators = ['physical flow', 'allocation']
-    df = df[df['indicator'].astype(str).str.lower().isin(valid_indicators)]
-
-    # Poimitaan päivämäärä
+    # Päivämäärät ja luokittelu
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     
-    # Luokitellaan maantieteellisesti
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- LOPULLINEN DUPLIKAATTIEN PURKU ---
-    # Nyt kun oikeat yksiköt on skaalattu ja kapasiteetti-indikaattorit tuhottu, 
-    # otetaan varmuuden vuoksi pienin arvo per päivä, jotta poistamme viimeisetkin haamut.
-    df_clean = df.groupby(['Category', 'pointKey', 'Date'], as_index=False)['value'].min()
+    # --- RATKAISEVA PRIORISOINTI (Haamulukujen ja nollien tuhoaja) ---
+    # Asetetaan luotettavuuspisteet riveille, jotta ohjelma osaa valita oikean tiedon
+    
+    # A. Onko kyseessä Gasgrid Finland? (Kantaverkkoyhtiön data on TOTUUS, ohittaa LNG-operaattorin)
+    df['is_tso'] = df['operatorKey'].astype(str).str.upper() == 'FI-TSO-0001'
+    
+    # B. Onko indikaattori Allocation? (Todellinen kaupallinen virta, EI tekninen kapasiteetti)
+    df['ind_rank'] = df['indicator'].astype(str).str.lower().map({'allocation': 1, 'physical flow': 2}).fillna(3)
+    
+    # C. Onko tila Actual? (Lopullinen toteutuma on parempi kuin ennuste)
+    df['stat_rank'] = df['statusKey'].astype(str).str.lower().map({'actual': 1, 'clearance': 1, 'confirmed': 2}).fillna(3)
+    
+    # Järjestetään DataFrame niin, että PARAS ja LUOTETTAVIN rivi on ylimpänä.
+    # Jos kaksi riviä on tismalleen samanarvoisia (esim. Gasgrid, Allocation, Actual), otetaan SUUREMPI arvo, 
+    # jotta vältetään tyhjät nollalla täytetyt rivit.
+    df = df.sort_values(
+        by=['Category', 'pointKey', 'Date', 'is_tso', 'ind_rank', 'stat_rank', 'value'],
+        ascending=[True, True, True, False, True, True, False]
+    )
+    
+    # Poistetaan duplikaatit pitämällä ensimmäinen (paras) rivi. 198 GWh maksimikapasiteetit katoavat!
+    df_clean = df.drop_duplicates(subset=['Category', 'pointKey', 'Date'], keep='first')
 
     return df_clean
 
