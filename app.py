@@ -16,16 +16,6 @@ st.set_page_config(
 
 # --- 1. ENTSOG DATA: OPTIMOITU SALAMAHAKU ---
 
-OPERATORS = [
-    'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
-    'LT-TSO-0001', # Amber Grid (Klaipėda, GIPL)
-]
-
-FINLAND_POINTS = [
-    'ITP-00495', # Inkoo FSRU
-    'ITP-00508', # Hamina LNG
-]
-
 def get_category(row):
     pk = str(row.get('pointKey', '')).upper()
     pl = str(row.get('pointLabel', '')).lower()
@@ -41,65 +31,59 @@ def get_category(row):
         return 'GIPL (Poland -> LT)'
     return None
 
-@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (noin 2-5 sekuntia)...")
+@st.cache_data(ttl=86400, show_spinner="Haetaan FinBalt gas entry -historiaa (kestää noin 3–5 sekuntia)...")
 def fetch_full_entsog_entry_history():
     today = datetime.today()
-    # Lasketaan dynaamisesti 24 kk taaksepäin nykyisestä kuukaudesta
     start_dt = (today.replace(day=1) - timedelta(days=24 * 31)).replace(day=1)
     
     from_str = start_dt.strftime('%Y-%m-%d')
     to_str = today.strftime('%Y-%m-%d')
+    
+    date_ranges = [
+        (from_str, (start_dt + timedelta(days=365)).strftime('%Y-%m-%d')),
+        (((start_dt + timedelta(days=365+1)).strftime('%Y-%m-%d')), to_str)
+    ]
 
     all_data = []
-    
-    # Käytetään Sessionia. Se pitää yhteyden auki API:in, jolloin haku on moninkertaisesti nopeampi.
-    session = requests.Session()
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
+    session = requests.Session()
 
-    # 1. Baltian TSO:t (Haetaan suoraan Physical Flow)
-    for op in OPERATORS:
-        params = {
-            'indicator': 'Physical Flow',
-            'from': from_str, 'to': to_str, 'limit': 5000,
-            'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
-        }
+    def fetch(params):
         try:
-            resp = session.get(url, params=params, timeout=15)
+            resp = session.get(url, params=params, timeout=12)
             if resp.status_code == 200:
                 all_data.extend(resp.json().get('operationalData', []))
-        except:
+        except Exception:
             pass
 
-    # 2. Suomen terminaalit (Haetaan yhdessä nipussa, ENTSOG palauttaa tällöin kaikki indikaattorit)
-    for pk in FINLAND_POINTS:
-        params = {
-            'from': from_str, 'to': to_str, 'limit': 5000,
-            'directionKey': 'entry', 'pointKey': pk, 'periodType': 'day'
-        }
-        try:
-            resp = session.get(url, params=params, timeout=15)
-            if resp.status_code == 200:
-                all_data.extend(resp.json().get('operationalData', []))
-        except:
-            pass
+    for d_start, d_end in date_ranges:
+        # 1. Baltia (Conexus & Amber Grid)
+        for op in ['LV-TSO-0001', 'LT-TSO-0001']:
+            fetch({
+                'indicator': 'Physical Flow', 'from': d_start, 'to': d_end,
+                'limit': 5000, 'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
+            })
+        
+        # 2. Suomi (Inkoo ja Hamina yhdistettynä samaan kutsuun API-rajapinnan nopeuttamiseksi)
+        fetch({
+            'indicator': 'Physical Flow', 'from': d_start, 'to': d_end,
+            'limit': 5000, 'directionKey': 'entry', 'pointKey': 'ITP-00495,ITP-00508', 'periodType': 'day'
+        })
 
     df = pd.DataFrame(all_data)
     if df.empty:
         return df
 
-    # Varmistetaan luvut
+    # Varmistetaan sarakkeiden olemassaolo
+    for col in ['unit', 'operatorKey', 'statusKey']:
+        if col not in df.columns:
+            df[col] = ''
+
+    # Perussuodatukset
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
-    
-    # Suodatetaan roskat
-    if 'periodType' in df.columns:
-        df = df[df['periodType'].astype(str).str.lower() == 'day']
-    if 'directionKey' in df.columns:
-        df = df[df['directionKey'].astype(str).str.lower() == 'entry']
-        
-    # Sallitaan sekä fyysinen virta että allokaatio, koska LNG-terminaalit käyttävät kumpaakin sekaisin
-    if 'indicator' in df.columns:
-        valid_inds = ['physical flow', 'allocation']
-        df = df[df['indicator'].astype(str).str.lower().isin(valid_inds)]
+    df = df[df['periodType'].astype(str).str.lower() == 'day']
+    df = df[df['directionKey'].astype(str).str.lower() == 'entry']
+    df = df[df['unit'].astype(str).str.lower().str.contains('kwh/d')]
 
     # Poimitaan päivämäärä
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
@@ -109,12 +93,25 @@ def fetch_full_entsog_entry_history():
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- LOPULLINEN RATKAISU DUPLIKAATTEIHIN JA HAAMULUKUIHIN ---
-    # Ryhmitellään tulokset pisteen ja päivän mukaan ja poimitaan PIENIN arvo.
-    # Koska ENTSOG palauttaa päällekkäin esim. todellisen virran (0 kWh tai 16 000 000 kWh) 
-    # sekä terminaalin maksimikapasiteetin (140 000 000 kWh),
-    # minimin ottaminen nappaa matemaattisen satavarmasti oikean virran ja jättää kapasiteettivuoren huomiotta.
-    df_clean = df.groupby(['Category', 'pointKey', 'Date'], as_index=False)['value'].min()
+    # --- TÄYDELLINEN DUPLIKAATTIEN PURKU (Ohittaa 140 GWh kapasiteettivirheet) ---
+    
+    # 1. Tunnistetaan kantaverkkoyhtiö Gasgridin viralliset rivit (Totuus Suomen virroista)
+    df['is_tso'] = df['operatorKey'].astype(str).str.upper() == 'FI-TSO-0001'
+    
+    # 2. Tunnistetaan varmistettu 'Actual' status
+    df['is_actual'] = df['statusKey'].astype(str).str.lower() == 'actual'
+    
+    # 3. Järjestetään data: 
+    # - Ensisijaisesti Gasgrid (True ensin)
+    # - Toissijaisesti 'Actual' status (True ensin)
+    # - Kolmanneksi pienin arvo (ohittaa valtavat maksimikapasiteetit, jos Gasgridiä ei löydy)
+    df = df.sort_values(
+        by=['pointKey', 'Date', 'is_tso', 'is_actual', 'value'], 
+        ascending=[True, True, False, False, True]
+    )
+    
+    # 4. Pudotetaan duplikaatit, jolloin käteen jää tasan yksi (se kaikkein luotettavin) rivi per päivä
+    df_clean = df.drop_duplicates(subset=['Category', 'pointKey', 'Date'], keep='first')
 
     return df_clean
 
@@ -134,7 +131,7 @@ if st.sidebar.button("Clear Cache & Refresh 🔄"):
 df_raw = fetch_full_entsog_entry_history()
 
 if df_raw.empty:
-    st.warning("Ei saatu yhteyttä ENTSOG API-rajapintaan. Napsauta 'Clear Cache & Refresh'.")
+    st.warning("Ei saatu yhteyttä ENTSOG API-rajapintaan tai data on tyhjä. Napsauta 'Clear Cache & Refresh'.")
 else:
     df_filtered = df_raw.copy()
     df_filtered['Date_Parsed'] = pd.to_datetime(df_filtered['Date'], utc=True)
