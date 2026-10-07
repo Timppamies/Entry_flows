@@ -7,14 +7,13 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-# Sovelluksen sivun asetukset
 st.set_page_config(
     page_title="FinBalt Natural Gas Entry Flows",
     page_icon="🔥",
     layout="wide"
 )
 
-# --- 1. BALTIAN HAKU (ENTSOG) ---
+# --- 1. BALTIAN HAKU ---
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid
     'LT-TSO-0001', # Amber Grid
@@ -68,14 +67,16 @@ def fetch_baltic_data():
 
         for d_start, d_end in date_ranges:
             for op in OPERATORS:
-                fetch_api({
-                    'indicator': 'Physical Flow', 
-                    'from': d_start, 
-                    'to': d_end,
-                    'directionKey': 'entry', 
-                    'operatorKey': op, 
-                    'periodType': 'day'
-                })
+                # Haetaan sekä entry että exit, jotta kausivaihtelu saadaan talteen
+                for dir_key in ['entry', 'exit']:
+                    fetch_api({
+                        'indicator': 'Physical Flow', 
+                        'from': d_start, 
+                        'to': d_end,
+                        'directionKey': dir_key, 
+                        'operatorKey': op, 
+                        'periodType': 'day'
+                    })
 
     df = pd.DataFrame(all_data)
     if df.empty:
@@ -83,12 +84,19 @@ def fetch_baltic_data():
         
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
     df = df[df['periodType'].astype(str).str.lower() == 'day']
-    df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     df['Category'] = df.apply(get_baltic_category, axis=1)
     df = df.dropna(subset=['Category'])
+
+    # Inčukalnsin kohdalla: varaston purku (withdrawal) on markkinalle tulevaa kaasua. 
+    # Jos ENTSOG merkitsee talvikuukausien purun exit-suunnaksi (varastosta ulos), otetaan se huomioon.
+    # Muille pisteille (LNG, GIPL) kelpuutetaan vain entry-suunta.
+    df = df[
+        ((df['Category'] == 'Inčukalns UGS (Withdrawal)')) | 
+        (df['directionKey'].astype(str).str.lower() == 'entry')
+    ]
 
     df_daily = df.groupby(['Date', 'Category', 'pointKey'], as_index=False)['value'].max()
     df_daily['Date_Parsed'] = pd.to_datetime(df_daily['Date'])
@@ -101,39 +109,22 @@ def fetch_baltic_data():
     return pivot
 
 
-# --- 2. SUOMEN TARKAT KUUKAUSIVOLYYMIT (Inkoo & Hamina LNG) ---
+# --- 2. SUOMEN TARKAT KUUKAUSIVOLYYMIT ---
 @st.cache_data(ttl=3600)
 def fetch_finland_actual_data():
     finland_data = {
-        '2025-01': 0.3,
-        '2025-02': 0.5,
-        '2025-03': 0.4,
-        '2025-04': 0.6,
-        '2025-05': 1.7,
-        '2025-06': 0.9,
-        '2025-07': 2.3,
-        '2025-08': 0.0,
-        '2025-09': 0.0,
-        '2025-10': 1.4,
-        '2025-11': 0.8,
-        '2025-12': 0.7,
-        '2026-01': 0.5,
-        '2026-02': 1.0,
-        '2026-03': 0.9,
-        '2026-04': 1.0,
-        '2026-05': 1.4,
-        '2026-06': 0.4,
-        '2026-07': 0.7,
-        '2026-08': 0.6
+        '2025-01': 0.3, '2025-02': 0.5, '2025-03': 0.4, '2025-04': 0.6,
+        '2025-05': 1.7, '2025-06': 0.9, '2025-07': 2.3, '2025-08': 0.0,
+        '2025-09': 0.0, '2025-10': 1.4, '2025-11': 0.8, '2025-12': 0.7,
+        '2026-01': 0.5, '2026-02': 1.0, '2026-03': 0.9, '2026-04': 1.0,
+        '2026-05': 1.4, '2026-06': 0.4, '2026-07': 0.7, '2026-08': 0.6
     }
-    
     df_fi = pd.DataFrame(list(finland_data.items()), columns=['Month', 'Inkoo & Hamina LNG'])
     df_fi.set_index('Month', inplace=True)
     return df_fi
 
 
-# --- 3. KÄYTTÖLIITTYMÄ JA YHDISTÄMINEN ---
-
+# --- 3. KÄYTTÖLIITTYMÄ ---
 st.title("🔥 FinBalt Natural Gas Entry Flows")
 st.markdown("Monthly gas supply volumes into the Finnish-Baltic regional gas market (TWh/month). Data source: **ENTSOG** & **Gasgrid Finland actuals**.")
 
@@ -169,7 +160,6 @@ else:
     latest_month = df_display.index[-1]
     latest_total = df_display.loc[latest_month].sum()
 
-    # --- KÄYTTÖLIITTYMÄN PIIRTÄMINEN ---
     st.subheader(f"Latest Month Overview ({latest_month})")
     m_cols = st.columns(len(categories_order) + 1)
 
@@ -195,7 +185,6 @@ else:
         color_discrete_sequence=px.colors.qualitative.Set2
     )
 
-    # Pyöristetään myös kaavion hover-tekstit yhteen desimaaliin
     fig.update_traces(texttemplate='%{y:.1f}', textposition='none')
     fig.update_layout(
         barmode='stack',
@@ -212,7 +201,6 @@ else:
     display_df = df_display.copy()
     display_df['Total (TWh)'] = display_df.sum(axis=1)
 
-    # Taulukon luvut pyöristettynä yhteen desimaaliin
     st.dataframe(display_df.style.format("{:.1f}"), use_container_width=True)
 
     csv_data = display_df.to_csv().encode('utf-8')
