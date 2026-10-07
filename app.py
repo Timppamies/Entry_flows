@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. BALTIAN HAKU (ENTSOG - mukana 2025 alkuvuoden poikkeuslogiikka) ---
+# --- 1. BALTIAN HAKU (ENTSOG) ---
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid
     'LT-TSO-0001', # Amber Grid
@@ -68,50 +68,57 @@ def fetch_baltic_data():
 
         for d_start, d_end in date_ranges:
             for op in OPERATORS:
-                # Haetaan varmuuden vuoksi molemmat suunnat, jotta poikkeus saadaan kiinni
-                for dir_key in ['entry', 'exit']:
-                    fetch_api({
-                        'indicator': 'Physical Flow', 
-                        'from': d_start, 
-                        'to': d_end,
-                        'directionKey': dir_key, 
-                        'operatorKey': op, 
-                        'periodType': 'day'
-                    })
+                fetch_api({
+                    'indicator': 'Physical Flow', 
+                    'from': d_start, 
+                    'to': d_end,
+                    'directionKey': 'entry', 
+                    'operatorKey': op, 
+                    'periodType': 'day'
+                })
 
     df = pd.DataFrame(all_data)
-    if df.empty:
-        return pd.DataFrame()
+    if not df.empty:
+        df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
+        df = df[df['periodType'].astype(str).str.lower() == 'day']
+        df = df[df['directionKey'].astype(str).str.lower() == 'entry']
+
+        date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
+        df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
+        df['Category'] = df.apply(get_baltic_category, axis=1)
+        df = df.dropna(subset=['Category'])
+
+        df_daily = df.groupby(['Date', 'Category', 'pointKey'], as_index=False)['value'].max()
+        df_daily['Date_Parsed'] = pd.to_datetime(df_daily['Date'])
+        df_daily['Month'] = df_daily['Date_Parsed'].dt.strftime('%Y-%m')
+
+        monthly_summary = df_daily.groupby(['Month', 'Category'])['value'].sum().reset_index()
+        monthly_summary['Value_TWh'] = monthly_summary['value'] / 1e9
         
-    df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
-    df = df[df['periodType'].astype(str).str.lower() == 'day']
+        pivot = monthly_summary.pivot(index='Month', columns='Category', values='Value_TWh').fillna(0)
+    else:
+        pivot = pd.DataFrame()
 
-    date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
-    df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
-    df['Category'] = df.apply(get_baltic_category, axis=1)
-    df = df.dropna(subset=['Category'])
+    # --- UGS 2025 ALKUBUUDEN KOVASTATISTIIKKATÄYDENNYS ---
+    ugs_early_2025 = {
+        '2025-01': 2.2,
+        '2025-02': 3.4,
+        '2025-03': 1.3,
+        '2025-04': 1.1
+    }
     
-    df['Month'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m')
-    df['dir'] = df['directionKey'].astype(str).str.lower()
+    col_name = 'Inčukalns UGS (Withdrawal)'
+    if col_name not in pivot.columns:
+        pivot[col_name] = 0.0
+        
+    for m_str, val in ugs_early_2025.items():
+        if m_str in pivot.index:
+            pivot.loc[m_str, col_name] = val
+        else:
+            # Jos kuukausi puuttuu pivotista kokonaan, lisätään se rivinä
+            pivot.loc[m_str, col_name] = val
 
-    # Puhdas ja täsmällinen poikkeussuodatus:
-    # 1. Inčukalns UGS: tammi-maaliskuu 2025 otetaan 'exit'-suunnasta, muut kuukaudet 'entry'-suunnasta.
-    # 2. Muut kategoriat (LNG, GIPL): aina 'entry'-suunnasta.
-    is_incukalns_early_2025 = (df['Category'] == 'Inčukalns UGS (Withdrawal)') & (df['Month'].isin(['2025-01', '2025-02', '2025-03'])) & (df['dir'] == 'exit')
-    is_incukalns_normal = (df['Category'] == 'Inčukalns UGS (Withdrawal)') & (~df['Month'].isin(['2025-01', '2025-02', '2025-03'])) & (df['dir'] == 'entry')
-    is_other_routes = (df['Category'] != 'Inčukalns UGS (Withdrawal)') & (df['dir'] == 'entry')
-
-    df = df[is_incukalns_early_2025 | is_incukalns_normal | is_other_routes]
-
-    df_daily = df.groupby(['Date', 'Category', 'pointKey'], as_index=False)['value'].max()
-    df_daily['Date_Parsed'] = pd.to_datetime(df_daily['Date'])
-    df_daily['Month'] = df_daily['Date_Parsed'].dt.strftime('%Y-%m')
-
-    monthly_summary = df_daily.groupby(['Month', 'Category'])['value'].sum().reset_index()
-    monthly_summary['Value_TWh'] = monthly_summary['value'] / 1e9
-    
-    pivot = monthly_summary.pivot(index='Month', columns='Category', values='Value_TWh').fillna(0)
-    return pivot
+    return pivot.sort_index()
 
 
 # --- 2. SUOMEN TARKAT KUUKAUSIVOLYYMIT (Inkoo & Hamina LNG) ---
