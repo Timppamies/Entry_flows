@@ -12,20 +12,69 @@ st.set_page_config(
     layout="wide"
 )
 
-@st.cache_data(ttl=3600, show_spinner=False)  # Välimuisti 1h
-def fetch_entsog_data_optimized(start_date_str, end_date_str):
+# Relevantit ENTSOG-pisteet (Inkoo, Hamina, Klaipėda, Santaka/GIPL, Inčukalns)
+# Suodatus suoraan API-tasolla estää muistin ylittymisen
+TARGET_POINTS = [
+    'FI-TP-0001', 'FI-TP-0002', # Inkoo / Hamina LNG
+    'LT-TP-0001', 'LT-TP-0002', # Klaipeda LNG / GIPL Santaka
+    'LV-TP-0001'                # Incukalns UGS
+]
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_entsog_chunk(from_str, to_str):
+    """
+    Välimuistitetaan yksittäiset 14 päivän jaksot erikseen. 
+    Näin sliderin siirtäminen ei tee koko haku uudestaan, 
+    vaan hyödyntää aiemmin ladatut pätkät.
+    """
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
+    offset = 0
+    limit = 5000
+    chunk_data = []
     
+    while True:
+        params = {
+            'indicator': 'Physical Flow',
+            'from': from_str,
+            'to': to_str,
+            'limit': limit,
+            'offset': offset,
+            'directionKey': 'entry' # Haetaan vain entry-virrat
+        }
+        
+        try:
+            response = requests.get(url, params=params, timeout=20)
+            if response.status_code == 200:
+                data = response.json().get('operationalData', [])
+                if not data:
+                    break
+                chunk_data.extend(data)
+                if len(data) < limit:
+                    break
+                offset += limit
+            elif response.status_code == 404:
+                break
+            else:
+                time.sleep(1)
+                break
+        except Exception:
+            break
+            
+    return chunk_data
+
+def get_all_entsog_data(start_date_str, end_date_str):
+    """
+    Kokoaa haun hyödyntäen välimuistitettuja pätkiä.
+    """
     start_dt = datetime.strptime(start_date_str, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date_str, '%Y-%m-%d')
     
-    all_data = []
+    all_records = []
     current_start = start_dt
     
+    total_days = (end_dt - start_dt).days or 1
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
-    total_days = (end_dt - start_dt).days or 1
     
     while current_start < end_dt:
         current_end = min(current_start + timedelta(days=14), end_dt)
@@ -33,75 +82,33 @@ def fetch_entsog_data_optimized(start_date_str, end_date_str):
         to_str = current_end.strftime('%Y-%m-%d')
         
         elapsed_days = (current_start - start_dt).days
-        progress = min(elapsed_days / total_days, 1.0)
-        progress_bar.progress(progress)
-        status_text.text(f"Fetching data from ENTSOG API: {from_str} to {to_str}...")
+        progress_bar.progress(min(elapsed_days / total_days, 1.0))
+        status_text.text(f"Fetching/Loading cached data: {from_str} to {to_str}...")
         
-        offset = 0
-        limit = 5000
+        # Haetaan pätkä (tulee välimuistista jos ladattu jo)
+        chunk = fetch_entsog_chunk(from_str, to_str)
+        all_records.extend(chunk)
         
-        while True:
-            params = {
-                'indicator': 'Physical Flow',
-                'from': from_str,
-                'to': to_str,
-                'limit': limit,
-                'offset': offset
-            }
-            
-            max_retries = 3
-            success = False
-            
-            for attempt in range(1, max_retries + 1):
-                try:
-                    response = requests.get(url, params=params, timeout=25)
-                    
-                    if response.status_code == 200:
-                        data = response.json().get('operationalData', [])
-                        if data:
-                            all_data.extend(data)
-                            if len(data) >= limit:
-                                offset += limit
-                            else:
-                                success = True
-                                break
-                        else:
-                            success = True
-                            break
-                    elif response.status_code == 404:
-                        success = True
-                        break
-                    else:
-                        time.sleep(attempt)
-                except (requests.exceptions.Timeout, requests.exceptions.RequestException):
-                    time.sleep(attempt)
-            
-            if not success or (response.status_code == 200 and len(data) < limit) or response.status_code == 404:
-                break
-                
         current_start = current_end + timedelta(days=1)
         
     progress_bar.empty()
     status_text.empty()
-    return pd.DataFrame(all_data)
+    return pd.DataFrame(all_records)
 
 def classify_flow(row):
     point_label = str(row.get('pointLabel', '')).lower()
     operator_label = str(row.get('operatorLabel', '')).lower()
     direction = str(row.get('directionKey', '')).lower()
     
-    if 'incukalns' in point_label or 'inčukalns' in point_label:
-        if direction == 'entry':
+    if direction == 'entry':
+        if 'incukalns' in point_label or 'inčukalns' in point_label:
             return 'Inčukalns UGS (Withdrawal)'
-    elif 'gipl' in point_label or 'santaka' in point_label:
-        if direction == 'entry':
+        elif 'gipl' in point_label or 'santaka' in point_label:
             return 'GIPL (Poland -> LT)'
-    elif 'klaipeda' in point_label or 'klaipėda' in point_label:
-        if 'lng' in point_label or 'terminal' in point_label or 'amber' in operator_label or 'kn' in operator_label:
-            if direction == 'entry':
+        elif 'klaipeda' in point_label or 'klaipėda' in point_label:
+            if 'lng' in point_label or 'terminal' in point_label or 'amber' in operator_label or 'kn' in operator_label:
                 return 'Klaipėda LNG'
-    elif 'inkoo' in point_label or 'hamina' in point_label:
-        if direction == 'entry':
+        elif 'inkoo' in point_label or 'hamina' in point_label:
             return 'Inkoo & Hamina LNG'
             
     return None
@@ -112,11 +119,11 @@ st.title("🔥 FinBalt Natural Gas Entry Flows")
 st.markdown("Monthly gas supply volumes into the Finnish-Baltic regional gas market (TWh/month). Data source: **ENTSOG Transparency Platform**.")
 
 st.sidebar.header("Settings")
-# Asetettu oletukseksi 6 kuukautta, jotta ensilataus on nopea pilvessä
 months_to_fetch = st.sidebar.slider("Select time period (months):", min_value=3, max_value=24, value=6, step=1)
 
-if st.sidebar.button("Refresh Data 🔄"):
+if st.sidebar.button("Clear Cache & Refresh 🔄"):
     st.cache_data.clear()
+    st.rerun()
 
 today = datetime.today()
 first_day_current_month = today.replace(day=1)
@@ -125,10 +132,11 @@ start_dt = (first_day_current_month - timedelta(days=months_to_fetch * 31)).repl
 start_date = start_dt.strftime('%Y-%m-%d')
 end_date = today.strftime('%Y-%m-%d')
 
-df_raw = fetch_entsog_data_optimized(start_date, end_date)
+# Haetaan data uutta pätkä-välimuistia hyödyntäen
+df_raw = get_all_entsog_data(start_date, end_date)
 
 if df_raw.empty:
-    st.warning("No data retrieved from ENTSOG. Please try clicking 'Refresh Data' or reduce the month range.")
+    st.warning("No data retrieved from ENTSOG API. Please try again or reduce the selected range.")
 else:
     df_raw['Category'] = df_raw.apply(classify_flow, axis=1)
     df_filtered = df_raw.dropna(subset=['Category']).copy()
