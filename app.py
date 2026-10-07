@@ -14,14 +14,16 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: NOPEA JA TURVALLINEN OPERAATTORIHAKU ---
+# --- 1. ENTSOG DATA: ÄLYKÄS PISTEHAKU JA OPERAATTORISUODATUS ---
 
-# Haetaan kaikki 3 maata puhtaasti virallisilla TSO-koodeilla, mikä pakottaa ENTSOGin 
-# kunnioittamaan Physical Flow -rajausta (estää kapasiteettiroskan).
 OPERATORS = [
-    'FI-TSO-0001', # Gasgrid Finland (Sisältää Inkoon ja Haminan)
-    'LV-TSO-0001', # Conexus Baltic Grid
-    'LT-TSO-0001', # Amber Grid
+    'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
+    'LT-TSO-0001', # Amber Grid (Klaipėda, GIPL)
+]
+
+FINLAND_POINTS = [
+    'ITP-00495', # Inkoo FSRU
+    'ITP-00508', # Hamina LNG
 ]
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -60,6 +62,42 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
 
     return chunk_records
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_entsog_point_chunk(point_key, from_str, to_str):
+    url = "https://transparency.entsog.eu/api/v1/operationalData.json"
+    offset = 0
+    limit = 5000
+    chunk_records = []
+
+    while True:
+        # Haetaan pointKey-haulla päiväkohtaiset virrat
+        params = {
+            'from': from_str,
+            'to': to_str,
+            'limit': limit,
+            'offset': offset,
+            'directionKey': 'entry',
+            'pointKey': point_key,
+            'periodType': 'day'
+        }
+
+        try:
+            response = requests.get(url, params=params, timeout=12)
+            if response.status_code == 200:
+                data = response.json().get('operationalData', [])
+                if not data:
+                    break
+                chunk_records.extend(data)
+                if len(data) < limit:
+                    break
+                offset += limit
+            else:
+                break
+        except Exception:
+            break
+
+    return chunk_records
+
 
 @st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (24kk)...")
 def fetch_full_entsog_entry_history():
@@ -75,9 +113,16 @@ def fetch_full_entsog_entry_history():
 
     all_data = []
 
+    # 1. Haetaan Baltia operaattoritasolla
     for op in OPERATORS:
         for from_str, to_str in date_ranges:
             records = fetch_entsog_operator_chunk(op, from_str, to_str)
+            all_data.extend(records)
+
+    # 2. Haetaan Suomi pistetasolla
+    for point_key in FINLAND_POINTS:
+        for from_str, to_str in date_ranges:
+            records = fetch_entsog_point_chunk(point_key, from_str, to_str)
             all_data.extend(records)
 
     df = pd.DataFrame(all_data)
@@ -85,36 +130,42 @@ def fetch_full_entsog_entry_history():
     if not df.empty:
         df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
 
+        # Suodatetaan päivä- ja tulosuunta
         if 'periodType' in df.columns:
             df = df[df['periodType'].astype(str).str.lower() == 'day']
-            
         if 'directionKey' in df.columns:
             df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-        # Yksikkökorjaus: Jos API palauttaa tuntiarvoja, skaalataan ne vuorokausiarvoiksi
-        unit_col = next((c for c in ['unitKey', 'unit'] if c in df.columns), None)
-        if unit_col:
-            is_hourly = df[unit_col].astype(str).str.lower().str.contains('/h')
-            df.loc[is_hourly, 'value'] = df.loc[is_hourly, 'value'] * 24
+        # Hyväksytään vain oikeat virtausindikaattorit (Physical Flow tai Allocation)
+        if 'indicator' in df.columns:
+            valid_inds = ['physical flow', 'allocation']
+            df = df[df['indicator'].astype(str).str.lower().isin(valid_inds)]
 
         date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
         if date_col:
             df['Clean_Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
             
-            # Valitaan duplikaateista paras (uusin tai oikea Actual-tila) kapasiteettimaksimin sijaan
-            if 'statusKey' in df.columns:
-                df['is_actual'] = df['statusKey'].astype(str).str.lower() == 'actual'
-            else:
-                df['is_actual'] = True
+            # --- TÄMÄ ON TAIKA, JOKA KORJAA SUOMEN LUVUT ---
+            def get_best_row(group):
+                # Lajitellaan arvot nollasta ylöspäin
+                g = group.sort_values('value')
                 
-            if 'version' in df.columns:
-                df['ver_num'] = pd.to_numeric(df['version'], errors='coerce').fillna(0)
-            else:
-                df['ver_num'] = 1
+                # 1. Etsitään ensisijaisesti Gasgridin ilmoittama data (virallinen TSO ohittaa LNG-operaattorien virheet)
+                gg = g[g['operatorLabel'].astype(str).str.lower().str.contains('gasgrid')]
+                if not gg.empty:
+                    return gg.iloc[-1]
                 
-            # Lajitellaan niin, että oikein ja uusin on viimeisenä, ja pudotetaan aiemmat
-            df = df.sort_values(['pointKey', 'Clean_Date', 'is_actual', 'ver_num'], ascending=[True, True, True, True])
-            df = df.drop_duplicates(subset=['pointKey', 'Clean_Date'], keep='last')
+                # 2. Jos Gasgridiä ei ole, otetaan PIENIN nollasta poikkeava arvo
+                # (Tämä leikkaa automaattisesti ne 240 GWh -haamurivit pois, jotka olivat oikeasti maksimikapasiteetteja)
+                nz = g[g['value'] > 0]
+                if not nz.empty:
+                    return nz.iloc[0]
+                
+                # 3. Muussa tapauksessa palautetaan viimeinen (esim. pelkkiä nollia)
+                return g.iloc[-1]
+
+            # Suoritetaan valinta per piste ja päivä, mikä poistaa kaikki kertaantumat 100% varmasti
+            df = df.groupby(['pointKey', 'Clean_Date'], as_index=False).apply(get_best_row).reset_index(drop=True)
 
     return df
 
@@ -123,7 +174,7 @@ def classify_entry_flow(row):
     pk = str(row.get('pointKey', '')).upper()
     pl = str(row.get('pointLabel', '')).lower()
 
-    # 1. Suomi: Täysin tiukka kohdistus suoraan Inkoon ja Haminan pistekoodeihin (ei päästä esim. Baltconnectoria tähän summaan)
+    # 1. Suomi: Täysin tiukka kohdistus suoraan Inkoon ja Haminan pistekoodeihin
     if pk in ['ITP-00495', 'ITP-00508']:
         return 'Inkoo & Hamina LNG'
 
