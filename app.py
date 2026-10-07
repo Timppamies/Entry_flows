@@ -14,14 +14,17 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: BALTIA KOSKEMATON + PISTEPAHAKU SUOMELLE ---
+# --- 1. ENTSOG DATA: NOPEA JA VAKAA HAKU (VAIN BALTIA) ---
+
+OPERATORS = [
+    'LV-TSO-0001', # Conexus Baltic Grid
+    'LT-TSO-0001', # Amber Grid
+]
 
 def get_category(row):
-    pk = str(row.get('pointKey', '')).upper()
     pl = str(row.get('pointLabel', '')).lower()
+    op = str(row.get('operatorKey', '')).upper()
     
-    if pk in ['ITP-00495', 'ITP-00508'] or 'inkoo' in pl or 'hamina' in pl:
-        return 'Inkoo & Hamina LNG'
     if 'incukalns' in pl or 'inčukalns' in pl:
         return 'Inčukalns UGS (Withdrawal)'
     if 'klaip' in pl or 'independence' in pl or 'kn' in pl:
@@ -31,7 +34,7 @@ def get_category(row):
         return 'GIPL (Poland -> LT)'
     return None
 
-@st.cache_data(ttl=3600, show_spinner="Noudetaan dataa ENTSOG-rajapinnasta (noin 5-10 sekuntia)...")
+@st.cache_data(ttl=3600, show_spinner="Noudetaan Baltian dataa ENTSOG-rajapinnasta...")
 def fetch_fast_entsog_data():
     today = datetime.today()
     start_dt = (today.replace(day=1) - timedelta(days=24 * 31)).replace(day=1)
@@ -67,8 +70,7 @@ def fetch_fast_entsog_data():
                     break
 
         for d_start, d_end in date_ranges:
-            # 1. BALTIA: Täysin koskematon ja alkuperäinen toimiva haku
-            for op in ['LV-TSO-0001', 'LT-TSO-0001']:
+            for op in OPERATORS:
                 fetch_api({
                     'indicator': 'Physical Flow', 
                     'from': d_start, 
@@ -77,18 +79,6 @@ def fetch_fast_entsog_data():
                     'operatorKey': op, 
                     'periodType': 'day'
                 })
-            
-            # 2. SUOMI: Haetaan suoraan LNG-terminaalien pistekoodeilla (Inkoo & Hamina)
-            for pk in ['ITP-00495', 'ITP-00508']:
-                for ind in ['Allocation', 'Physical Flow']:
-                    fetch_api({
-                        'indicator': ind,
-                        'from': d_start, 
-                        'to': d_end,
-                        'directionKey': 'entry', 
-                        'pointKey': pk, 
-                        'periodType': 'day'
-                    })
 
     df = pd.DataFrame(all_data)
     return df
@@ -98,6 +88,9 @@ def fetch_fast_entsog_data():
 
 st.title("🔥 FinBalt Natural Gas Entry Flows")
 st.markdown("Monthly gas supply volumes into the Finnish-Baltic regional gas market (TWh/month). Data source: **ENTSOG Transparency Platform**.")
+
+# Disclaimer englanniksi Suomen datan tilasta
+st.warning("⚠️ **Notice:** Inkoo & Hamina LNG (Finland) data integration is currently under maintenance and temporarily disabled due to ENTSOG API reporting anomalies. The figures for Finnish entry flows are excluded until a reliable data pipeline is established.")
 
 st.sidebar.header("Settings")
 months_to_show = st.sidebar.slider("Select time period (months):", min_value=3, max_value=24, value=12, step=1)
@@ -113,32 +106,17 @@ if df_raw.empty:
 else:
     df = df_raw.copy()
     
-    # Varmistetaan luvut
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
     df = df[df['periodType'].astype(str).str.lower() == 'day']
     df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-    # --- YKSIKKÖKORJAUS SUOMELLE (kWh/h -> kWh/d tarvittaessa) ---
-    if 'unit' in df.columns:
-        unit_low = df['unit'].astype(str).str.lower()
-        is_finland_hourly = df['pointKey'].astype(str).str.upper().isin(['ITP-00495', 'ITP-00508']) & unit_low.str.contains('kwh/h')
-        df.loc[is_finland_hourly, 'value'] = df.loc[is_finland_hourly, 'value'] * 24
-
-    # Kategoriat ja päivämäärät
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- KAPASITEETTILEIKKURI SUOMELLE ---
-    # Poistetaan mahdolliset Inkoon/Haminan yli 120 GWh kapasiteettirivit
-    is_finland = df['Category'] == 'Inkoo & Hamina LNG'
-    df.loc[is_finland & (df['value'] > 120000000), 'value'] = 0.0
-
-    # --- PÄIVÄTASON AGGREGOINTI ---
     df_daily = df.groupby(['Date', 'Category', 'pointKey'], as_index=False)['value'].max()
     
-    # --- KUUKAUSITASON AGGREGOINTI ---
     df_daily['Date_Parsed'] = pd.to_datetime(df_daily['Date'])
     df_daily['Month'] = df_daily['Date_Parsed'].dt.strftime('%Y-%m')
 
@@ -150,8 +128,7 @@ else:
     categories_order = [
         'Inčukalns UGS (Withdrawal)', 
         'GIPL (Poland -> LT)', 
-        'Klaipėda LNG', 
-        'Inkoo & Hamina LNG'
+        'Klaipėda LNG'
     ]
 
     for col in categories_order:
@@ -164,11 +141,10 @@ else:
     latest_month = df_display.index[-1]
     latest_total = df_display.loc[latest_month].sum()
 
-    # --- KÄYTTÖLIITTYMÄN PIIRTÄMINEN ---
     st.subheader(f"Latest Month Overview ({latest_month})")
     m_cols = st.columns(len(categories_order) + 1)
 
-    m_cols[0].metric(label="Total Supply", value=f"{latest_total:.3f} TWh")
+    m_cols[0].metric(label="Total Baltic Supply", value=f"{latest_total:.3f} TWh")
     for idx, col in enumerate(categories_order):
         val = df_display.loc[latest_month, col]
         m_cols[idx + 1].metric(label=col, value=f"{val:.3f} TWh")
@@ -184,7 +160,7 @@ else:
         x='Month', 
         y='TWh', 
         color='Entry Route',
-        title=f"FinBalt Natural Gas Entry Flows (Last {months_to_show} Months)",
+        title=f"Baltic Natural Gas Entry Flows (Last {months_to_show} Months)",
         labels={'TWh': 'Energy (TWh / month)', 'Month': 'Month'},
         template='plotly_white',
         color_discrete_sequence=px.colors.qualitative.Set2
@@ -210,6 +186,6 @@ else:
     st.download_button(
         label="Download Data as CSV 📥",
         data=csv_data,
-        file_name=f"finbalt_gas_entry_flows_{latest_month}.csv",
+        file_name=f"baltic_gas_entry_flows_{latest_month}.csv",
         mime="text/csv"
     )
