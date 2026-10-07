@@ -14,14 +14,14 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: BALTIA KOSKEMATON + SUOMEN ERILLISHAKU ---
+# --- 1. ENTSOG DATA: BALTIA KOSKEMATON + SUOMEN KORJATTU HAKU ---
 
 def get_category(row):
     pk = str(row.get('pointKey', '')).upper()
     pl = str(row.get('pointLabel', '')).lower()
     op = str(row.get('operatorKey', '')).upper()
     
-    if op == 'FI-TSO-0001':
+    if op == 'FI-TSO-0001' or 'inkoo' in pl or 'hamina' in pl:
         return 'Inkoo & Hamina LNG'
     if 'incukalns' in pl or 'inčukalns' in pl:
         return 'Inčukalns UGS (Withdrawal)'
@@ -79,9 +79,8 @@ def fetch_fast_entsog_data():
                     'periodType': 'day'
                 })
             
-            # 2. SUOMI: Haetaan erikseen Allocation-indikaattorilla, sillä Gasgrid käyttää sitä
+            # 2. SUOMI: Haetaan Gasgridin (`FI-TSO-0001`) data ilman indikaattorirajoitusta, jotta kaikki arvot tulevat varmasti mukaan
             fetch_api({
-                'indicator': 'Allocation', 
                 'from': d_start, 
                 'to': d_end,
                 'directionKey': 'entry', 
@@ -123,7 +122,8 @@ else:
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- KAPASITEETTILEIKKURI SUOMELLE (Suodattaa mahdolliset kapasiteettipiikit pois) ---
+    # --- KAPASITEETTILEIKKURI SUOMELLE ---
+    # Poistetaan mahdolliset Inkoon/Haminan yli 120 GWh kapasiteettirivit
     is_finland = df['Category'] == 'Inkoo & Hamina LNG'
     df.loc[is_finland & (df['value'] > 120000000), 'value'] = 0.0
 
