@@ -14,14 +14,13 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: BALTIA KOSKEMATON + KORJATTU SUOMEN HAKU ---
+# --- 1. ENTSOG DATA: BALTIA KOSKEMATON + PISTEPAHAKU SUOMELLE ---
 
 def get_category(row):
     pk = str(row.get('pointKey', '')).upper()
     pl = str(row.get('pointLabel', '')).lower()
-    op = str(row.get('operatorKey', '')).upper()
     
-    if op == 'FI-TSO-0001' or 'inkoo' in pl or 'hamina' in pl:
+    if pk in ['ITP-00495', 'ITP-00508'] or 'inkoo' in pl or 'hamina' in pl:
         return 'Inkoo & Hamina LNG'
     if 'incukalns' in pl or 'inčukalns' in pl:
         return 'Inčukalns UGS (Withdrawal)'
@@ -68,7 +67,7 @@ def fetch_fast_entsog_data():
                     break
 
         for d_start, d_end in date_ranges:
-            # 1. BALTIA: Koskematon ja täsmälleen alkuperäinen toimiva haku
+            # 1. BALTIA: Täysin koskematon ja alkuperäinen toimiva haku
             for op in ['LV-TSO-0001', 'LT-TSO-0001']:
                 fetch_api({
                     'indicator': 'Physical Flow', 
@@ -79,16 +78,17 @@ def fetch_fast_entsog_data():
                     'periodType': 'day'
                 })
             
-            # 2. SUOMI: Haetaan Gasgridin (`FI-TSO-0001`) data Allocation-indikaattorilla, jotta luvut eivät jää nollille
-            for ind in ['Allocation', 'Physical Flow']:
-                fetch_api({
-                    'indicator': ind,
-                    'from': d_start, 
-                    'to': d_end,
-                    'directionKey': 'entry', 
-                    'operatorKey': 'FI-TSO-0001', 
-                    'periodType': 'day'
-                })
+            # 2. SUOMI: Haetaan suoraan LNG-terminaalien pistekoodeilla (Inkoo & Hamina)
+            for pk in ['ITP-00495', 'ITP-00508']:
+                for ind in ['Allocation', 'Physical Flow']:
+                    fetch_api({
+                        'indicator': ind,
+                        'from': d_start, 
+                        'to': d_end,
+                        'directionKey': 'entry', 
+                        'pointKey': pk, 
+                        'periodType': 'day'
+                    })
 
     df = pd.DataFrame(all_data)
     return df
@@ -121,7 +121,7 @@ else:
     # --- YKSIKKÖKORJAUS SUOMELLE (kWh/h -> kWh/d tarvittaessa) ---
     if 'unit' in df.columns:
         unit_low = df['unit'].astype(str).str.lower()
-        is_finland_hourly = (df['operatorKey'].astype(str).str.upper() == 'FI-TSO-0001') & unit_low.str.contains('kwh/h')
+        is_finland_hourly = df['pointKey'].astype(str).str.upper().isin(['ITP-00495', 'ITP-00508']) & unit_low.str.contains('kwh/h')
         df.loc[is_finland_hourly, 'value'] = df.loc[is_finland_hourly, 'value'] * 24
 
     # Kategoriat ja päivämäärät
