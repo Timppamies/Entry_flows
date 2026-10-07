@@ -189,4 +189,31 @@ else:
         y='TWh', 
         color='Entry Route',
         title=f"FinBalt Natural Gas Entry Flows (Last {months_to_show} Months)",
-        labels={'TWh': 'Energy (TWh / month)', 'Month': '
+        labels={'TWh': 'Energy (TWh / month)', 'Month': 'Month'},
+        template='plotly_white',
+        color_discrete_sequence=px.colors.qualitative.Set2
+    )
+
+    fig.update_layout(
+        barmode='stack',
+        xaxis_tickangle=-45,
+        legend_title_text='Supply Route',
+        height=500,
+        hovermode="x unified"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Data Summary Table")
+    display_df = df_display.copy()
+    display_df['Total (TWh)'] = display_df.sum(axis=1)
+
+    st.dataframe(display_df.style.format("{:.3f}"), use_container_width=True)
+
+    csv_data = display_df.to_csv().encode('utf-8')
+    st.download_button(
+        label="Download Data as CSV 📥",
+        data=csv_data,
+        file_name=f"finbalt_gas_entry_flows_{latest_month}.csv",
+        mime="text/csv"
+    )
