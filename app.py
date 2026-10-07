@@ -24,10 +24,6 @@ OPERATORS = [
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
-    """
-    Hakee tietyn operaattorin entry-virrat päiväkohtaisesti (periodType=day).
-    Rajoitettu aikaväli estää API:n timeout-virheet ja lataa sekunneissa.
-    """
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
     offset = 0
     limit = 5000
@@ -65,9 +61,6 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
 
 @st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (24kk)...")
 def fetch_full_entsog_entry_history():
-    """
-    Kokoaa 24 kuukauden historiandatan kahdessa 12kk jaksossa per operaattori.
-    """
     today = datetime.today()
     first_day_current_month = today.replace(day=1)
     start_dt = (first_day_current_month - timedelta(days=24 * 31)).replace(day=1)
@@ -90,27 +83,33 @@ def fetch_full_entsog_entry_history():
 
 def classify_entry_flow(row):
     """
-    Luokittelee syöttövirrat kategorioihin tarkan nimentän perusteella.
+    Luokittelee syöttövirrat kategorioihin tarkan nimentän ja operaattorin perusteella.
     """
     point_label = str(row.get('pointLabel', '')).lower()
+    operator_key = str(row.get('operatorKey', '')).upper()
     operator_label = str(row.get('operatorLabel', '')).lower()
     combined = f"{point_label} {operator_label}"
 
-    # 1. Inčukalns-varasto
+    # 1. Suomen maahantuonti (Gasgrid FI-TSO-0001): Kaikki Suomeen tuleva entry on LNG:tä (Inkoo / Hamina)
+    if operator_key == 'FI-TSO-0001':
+        return 'Inkoo & Hamina LNG'
+
+    # 2. Inčukalns-varasto (Latvia)
     if 'incukalns' in combined or 'inčukalns' in combined:
         return 'Inčukalns UGS (Withdrawal)'
 
-    # 2. Klaipėda LNG
-    if 'klaip' in combined or 'independence' in combined or 'kn energies' in combined:
-        return 'Klaipėda LNG'
-
-    # 3. Inkoo & Hamina LNG
-    if 'inkoo' in combined or 'hamina' in combined:
-        return 'Inkoo & Hamina LNG'
+    # 3. Klaipėda LNG (Liettua)
+    if 'klaip' in combined or 'independence' in combined or 'kn' in combined or 'lng' in combined:
+        if operator_key == 'LT-TSO-0001' and not ('gipl' in combined or 'santaka' in combined or 'latvia' in combined or 'belarus' in combined):
+            return 'Klaipėda LNG'
 
     # 4. GIPL (Puola -> Liettua)
-    if 'gipl' in combined or 'santaka' in combined:
+    if 'gipl' in combined or 'santaka' in combined or 'poland' in combined:
         return 'GIPL (Poland -> LT)'
+        
+    # Yleistunnistus Liettuan Amber Gridin muille mahdollisille LNG-merkinnöille jos yllä olevat eivät osu
+    if operator_key == 'LT-TSO-0001' and ('klaipeda' in combined or 'klaipėda' in combined):
+        return 'Klaipėda LNG'
 
     return None
 
