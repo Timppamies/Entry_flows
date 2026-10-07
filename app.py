@@ -106,7 +106,7 @@ def fetch_entsog_point_chunk(point_key, from_str, to_str):
             break
     return chunk_records
 
-@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (24kk)...")
+@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (tämä kestää n. 30s)...")
 def fetch_full_entsog_entry_history():
     today = datetime.today()
     first_day_current_month = today.replace(day=1)
@@ -135,7 +135,7 @@ def fetch_full_entsog_entry_history():
     # Varmistetaan luvut
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
     
-    # Suodatetaan roskat
+    # Perussuodatus
     if 'periodType' in df.columns:
         df = df[df['periodType'].astype(str).str.lower() == 'day']
     if 'directionKey' in df.columns:
@@ -151,29 +151,25 @@ def fetch_full_entsog_entry_history():
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- ÄLYKÄS DUPLIKAATTIEN PURKU (Estää Inkoon 6 TWh:n maksimikapasiteettivirheen) ---
-    # Ryhmitellään pisteen, päivän ja operaattorin mukaan ottaen kunkin operaattorin ilmoittama suurin luku
-    df_ops = df.groupby(['Category', 'pointKey', 'Date', 'operatorKey'], dropna=False, as_index=False)['value'].max()
+    # --- TÄYDELLINEN DUPLIKAATTIEN PURKU ILMAN MAX() FUNKTIOTA ---
+    def pick_true_physical_flow(group):
+        valid = group[group['value'] > 0]
+        if valid.empty:
+            return group.iloc[0] # Vain nollia tarjolla
+            
+        # 1. Jos datassa on 'Actual'-status, se on kaikkein todennäköisimmin toteutuma
+        if 'statusKey' in valid.columns:
+            actuals = valid[valid['statusKey'].astype(str).str.lower() == 'actual']
+            if not actuals.empty:
+                # Otetaan Actual-riveistä pienin arvo varmuuden vuoksi
+                return actuals.loc[actuals['value'].idxmin()]
+                
+        # 2. Jos statusta ei ole, ohitetaan sokeasti valtavat 140 GWh kapasiteettihäiriöt
+        # ottamalla päivän pienin nollasta poikkeava arvo. 
+        return valid.loc[valid['value'].idxmin()]
 
-    valid_tsos = ['FI-TSO-0001', 'LV-TSO-0001', 'LT-TSO-0001']
-
-    def pick_best_operator(group):
-        # 1. Ensisijaisesti virallisen TSO:n (esim. Gasgrid) luvut (nämä ovat aina todellisia virtoja, eivät kapasiteetteja)
-        tso_rows = group[group['operatorKey'].astype(str).str.upper().isin(valid_tsos)]
-        if not tso_rows.empty:
-            return tso_rows.loc[tso_rows['value'].idxmax()]
-        
-        # 2. Jos TSO:ta ei löydy, valitaan pienin nollasta poikkeava luku
-        # (Tämä skippaa LNG-operaattoreiden ilmoittaman 140 GWh:n kapasiteetin ja poimii 16 GWh:n toteutuman)
-        pos_rows = group[group['value'] > 0]
-        if not pos_rows.empty:
-            return pos_rows.loc[pos_rows['value'].idxmin()]
-        
-        # 3. Jos kaikki on nollia
-        return group.iloc[0]
-
-    # Ajetaan älykäs suodatus ja poistetaan näin kaikki duplikaatit lopullisesti
-    df_clean = df_ops.groupby(['Category', 'pointKey', 'Date'], as_index=False).apply(pick_best_operator).reset_index(drop=True)
+    # Ajetaan suodatus per kategoria, piste ja päivä
+    df_clean = df.groupby(['Category', 'pointKey', 'Date'], as_index=False).apply(pick_true_physical_flow).reset_index(drop=True)
 
     return df_clean
 
