@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: OPTIMOITU JA ÄLYKÄS HAKU ---
+# --- 1. ENTSOG DATA: LOPULLINEN SALAMAHAKU JA ÄLYKÄS PUHDISTUS ---
 
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
@@ -41,7 +41,7 @@ def get_category(row):
         return 'GIPL (Poland -> LT)'
     return None
 
-@st.cache_data(ttl=86400, show_spinner="Haetaan ja puhdistetaan rajapintadataa (kestää noin 5-10 sekuntia)...")
+@st.cache_data(ttl=86400, show_spinner="Haetaan rajapintadataa (kestää noin 5–10 sekuntia)...")
 def fetch_full_entsog_entry_history():
     today = datetime.today()
     start_dt = (today.replace(day=1) - timedelta(days=24 * 31)).replace(day=1)
@@ -49,7 +49,6 @@ def fetch_full_entsog_entry_history():
     from_str = start_dt.strftime('%Y-%m-%d')
     to_str = today.strftime('%Y-%m-%d')
     
-    # Jaetaan 2 vuoden haku kahteen palaan, jotta API ei pätki
     date_ranges = [
         (from_str, (start_dt + timedelta(days=365)).strftime('%Y-%m-%d')),
         (((start_dt + timedelta(days=365+1)).strftime('%Y-%m-%d')), to_str)
@@ -59,39 +58,49 @@ def fetch_full_entsog_entry_history():
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
     session = requests.Session()
 
-    def fetch(params):
-        try:
-            resp = session.get(url, params=params, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json().get('operationalData', [])
-                if data:
+    # Optimoitu haku, joka varmistaa sivutuksen (pagination), jottei data katkea kesken
+    def fetch(base_params):
+        offset = 0
+        limit = 5000
+        base_params['limit'] = limit
+        while True:
+            base_params['offset'] = offset
+            try:
+                resp = session.get(url, params=base_params, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json().get('operationalData', [])
+                    if not data:
+                        break
                     all_data.extend(data)
-        except Exception:
-            pass
+                    if len(data) < limit:
+                        break
+                    offset += limit
+                else:
+                    break
+            except Exception:
+                break
 
     for d_start, d_end in date_ranges:
-        # 1. Baltia: Haetaan suoraan operaattorilla ja Physical Flow'lla (toimii heille luotettavasti)
+        # 1. Baltia: Vain Physical Flow
         for op in OPERATORS:
             fetch({
                 'indicator': 'Physical Flow', 'from': d_start, 'to': d_end,
-                'limit': 5000, 'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
+                'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
             })
         
-        # 2. Suomi: Haetaan pisteillä. Haetaan SEKÄ Allocation ETTÄ Physical Flow.
-        # Allocation tuo oikeat kaupalliset virrat.
+        # 2. Suomi: Haetaan Physical Flow ja Allocation. Kattaa varmasti todelliset virrat.
         for pk in FINLAND_POINTS:
-            for ind in ['Allocation', 'Physical Flow', 'Nomination']:
+            for ind in ['Physical Flow', 'Allocation']:
                 fetch({
                     'indicator': ind, 'from': d_start, 'to': d_end,
-                    'limit': 5000, 'directionKey': 'entry', 'pointKey': pk, 'periodType': 'day'
+                    'directionKey': 'entry', 'pointKey': pk, 'periodType': 'day'
                 })
 
     df = pd.DataFrame(all_data)
     if df.empty:
         return df
 
-    # Varmistetaan sarakkeet
-    for col in ['indicator', 'statusKey']:
+    for col in ['operatorKey', 'indicator']:
         if col not in df.columns:
             df[col] = ''
 
@@ -99,50 +108,31 @@ def fetch_full_entsog_entry_history():
     df = df[df['periodType'].astype(str).str.lower() == 'day']
     df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-    # Pudotetaan välittömästi kaikki kapasiteettiin viittaavat indikaattorit (jos niitä eksyi mukaan)
-    df = df[~df['indicator'].astype(str).str.lower().str.contains('capacity')]
-
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- ÄLYKÄS TUOMARI: LOPULLINEN DUPLIKAATTIEN PURKU ---
-    
-    # 1. Arvostellaan Indikaattorit (1 on paras)
-    # Allocation (allokoitu toteuma) on aina oikea kaasuvirta. 
-    # Physical Flow luokitellaan huonoimmaksi Suomelle, koska se on saastunut kapasiteetilla.
-    def get_ind_rank(ind):
-        ind = str(ind).lower()
-        if 'allocation' in ind: return 1
-        if 'measured' in ind: return 2
-        if 'nomination' in ind: return 3
-        if 'physical flow' in ind: return 4 
-        return 5
-    df['ind_rank'] = df['indicator'].apply(get_ind_rank)
-    
-    # 2. Arvostellaan Status (1 on paras)
-    # Lopullinen toteutuma (Actual) on luotettavampi kuin alustava ilmoitus
-    def get_stat_rank(stat):
-        stat = str(stat).lower()
-        if 'actual' in stat: return 1
-        if 'clearance' in stat: return 2
-        if 'confirmed' in stat: return 3
-        return 4
-    df['stat_rank'] = df['statusKey'].apply(get_stat_rank)
-    
-    # 3. Järjestetään data: 
-    # - Ensin paras indikaattori (Allocation)
-    # - Sitten paras status (Actual)
-    # - LOPUKSI SUURIN ARVO (value=False). Tämä estää ohjelmaa ottamasta nollaa, jos päivältä löytyy myös todellinen virtaus!
-    df = df.sort_values(
-        by=['Category', 'pointKey', 'Date', 'ind_rank', 'stat_rank', 'value'],
-        ascending=[True, True, True, True, True, False]
-    )
-    
-    # 4. Pudotetaan duplikaatit pitämällä ensimmäinen rivi. Takaa täydellisen tarkkuuden per päivä.
-    df_clean = df.drop_duplicates(subset=['Category', 'pointKey', 'Date'], keep='first')
+    # --- ÄLYKÄS TUOMARI: KAPASITEETTIHAAMUJEN LOPULLINEN TUHOAJA ---
+    def get_best_index(group):
+        # 1. Etsitään kantaverkkoyhtiö Gasgridin virallinen raportointi (Ei ikinä sisällä LNG-kapasiteettia)
+        tso = group[group['operatorKey'].astype(str).str.upper() == 'FI-TSO-0001']
+        if not tso.empty:
+            # Jos Gasgrid raportoi Allokaation, se on absoluuttinen totuus
+            alloc = tso[tso['indicator'].astype(str).str.lower() == 'allocation']
+            if not alloc.empty:
+                return alloc.index[0]
+            return tso.index[0]
+            
+        # 2. Jos Gasgridiä ei löydy, otetaan päivän PIENIN arvo.
+        # Maksimikapasiteetti on ~140 GWh. Todellinen virta on 0-40 GWh.
+        # Minimi ottaa matemaattisen varmasti todellisen virran ja sivuuttaa 140 GWh:n kapasiteetin täysin.
+        return group['value'].idxmin()
+
+    # Sovelletaan tuomaria jokaiseen päivään ja pisteeseen
+    best_indices = df.groupby(['Category', 'pointKey', 'Date']).apply(get_best_index)
+    df_clean = df.loc[best_indices].reset_index(drop=True)
 
     return df_clean
 
