@@ -13,7 +13,8 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG MÄÄRITTELYT ---
+# --- 1. ENTSOG TÄSMÄMÄÄRITYKSET ---
+# Avaimet ja koodit ENTSOG Transparency Platformin mukaisesti
 ENTRY_CONFIG = [
     {
         'category': 'Inkoo & Hamina LNG',
@@ -42,44 +43,60 @@ ENTRY_CONFIG = [
     }
 ]
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_single_point_data(operator_key, point_key, start_date_str, end_date_str):
+def fetch_chunk(operator_key, point_key, from_date, to_date):
     """
-    Hakee täsmällisen yksittäisen syöttöpisteen päivätason datan ENTSOG APIsta.
-    Käyttää virallista /operationaldatas.json -rajapintaa.
+    Hakee yhtä tiettyä ajanjaksoa ENTSOG operationaldatas-rajapinnasta.
     """
     url = "https://transparency.entsog.eu/api/v1/operationaldatas.json"
-    
     params = {
         'indicator': 'Physical Flow',
-        'from': start_date_str,
-        'to': end_date_str,
+        'from': from_date,
+        'to': to_date,
         'limit': -1,
         'directionKey': 'entry',
         'operatorKey': operator_key,
         'pointKey': point_key,
         'periodType': 'day'
     }
-    
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) StreamlitApp/1.0'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
     }
     
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=20)
-        if response.status_code == 200:
-            res_json = response.json()
-            # ENTSOG palauttaa datan joko 'operationaldatas' tai 'operationalData' -avaimella
-            if 'operationaldatas' in res_json:
-                return res_json['operationaldatas']
-            elif 'operationalData' in res_json:
-                return res_json['operationalData']
-    except Exception as e:
-        st.error(f"API virhe ({point_key}): {e}")
+        r = requests.get(url, params=params, headers=headers, timeout=12)
+        if r.status_code == 200:
+            res = r.json()
+            return res.get('operationaldatas', res.get('operationalData', []))
+    except Exception:
+        pass
     return []
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_single_point_history(operator_key, point_key, start_date_str, end_date_str):
+    """
+    Pilkkoo 24kk haun 6 kuukauden palasiin estääkseen ENTSOG API 60s timeout -virheet.
+    """
+    start_dt = datetime.strptime(start_date_str, '%Y-%m-%d')
+    end_dt = datetime.strptime(end_date_str, '%Y-%m-%d')
+    
+    all_data = []
+    curr_start = start_dt
+    
+    # Haetaan max 180 päivää kerrallaan
+    while curr_start < end_dt:
+        curr_end = min(curr_start + timedelta(days=180), end_dt)
+        chunk_data = fetch_chunk(
+            operator_key, 
+            point_key, 
+            curr_start.strftime('%Y-%m-%d'), 
+            curr_end.strftime('%Y-%m-%d')
+        )
+        all_data.extend(chunk_data)
+        curr_start = curr_end + timedelta(days=1)
+        
+    return all_data
 
-@st.cache_data(ttl=86400, show_spinner="Haetaan FinBalt gas entry -virtoja ENTSOG-rajapinnasta...")
+@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt-kaasutietoja ENTSOG-rajapinnasta...")
 def fetch_all_entry_flows():
     today = datetime.today()
     first_day_current_month = today.replace(day=1)
@@ -91,7 +108,7 @@ def fetch_all_entry_flows():
     all_records = []
 
     for item in ENTRY_CONFIG:
-        records = fetch_single_point_data(
+        records = fetch_single_point_history(
             item['operatorKey'], 
             item['pointKey'], 
             start_date_str, 
@@ -104,7 +121,7 @@ def fetch_all_entry_flows():
     return pd.DataFrame(all_records)
 
 
-# --- 2. KÄYTTÖLIITTYMÄ ---
+# --- 2. STREAMLIT KÄYTTÖLIITTYMÄ ---
 
 st.title("🔥 FinBalt Natural Gas Entry Flows")
 st.markdown("Monthly gas supply volumes into the Finnish-Baltic regional gas market (TWh/month). Data source: **ENTSOG Transparency Platform**.")
@@ -119,14 +136,13 @@ if st.sidebar.button("Clear Cache & Refresh 🔄"):
 df_raw = fetch_all_entry_flows()
 
 if df_raw.empty:
-    st.warning("Ei saatu yhteyttä ENTSOG API-rajapintaan tai palautettu data oli tyhjää. Yritä painaa 'Clear Cache & Refresh'.")
+    st.error("Ei saatu yhteyttä ENTSOG API-rajapintaan tai vastaukset olivat tyhjiä. Kokeile 'Clear Cache & Refresh'.")
 else:
-    # Etsitään päivämääräsarake
     date_candidates = ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn']
     date_col = next((c for c in date_candidates if c in df_raw.columns), None)
     
     if not date_col:
-        st.error("Päivämääräsarakaetta ei löytynyt rajapinnan vastauksesta.")
+        st.error("Päivämääräsarakaetta ei tunnistettu vastausdatasta.")
     else:
         df_raw['value'] = pd.to_numeric(df_raw['value'], errors='coerce').fillna(0)
         df_raw['Date_Parsed'] = pd.to_datetime(df_raw[date_col], utc=True)
@@ -166,7 +182,7 @@ else:
 
         st.markdown("---")
 
-        # --- Kuvaaja ---
+        # --- Plotly Graph ---
         st.subheader("Monthly Gas Supply by Route (TWh)")
         plot_df = df_display.reset_index().melt(id_vars='Month', var_name='Entry Route', value_name='TWh')
 
@@ -191,7 +207,7 @@ else:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Taulukko ---
+        # --- Table & Download ---
         st.subheader("Data Summary Table")
         display_df = df_display.copy()
         display_df['Total (TWh)'] = display_df.sum(axis=1)
