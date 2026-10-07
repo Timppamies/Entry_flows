@@ -14,12 +14,16 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: OPERAATTORIPOHJAINEN HAKU (FI, LV, LT) ---
+# --- 1. ENTSOG DATA: PUHDAS PISTEPOHJAINEN HAKU OIKEALLA SUODATUKSELLA ---
 
 OPERATORS = [
-    'FI-TSO-0001', # Gasgrid Finland (Inkoo, Hamina, Baltconnector ym.)
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
     'LT-TSO-0001', # Amber Grid (Klaipėda, GIPL)
+]
+
+FINLAND_POINTS = [
+    'ITP-00495', # Inkoo FSRU
+    'ITP-00508', # Hamina LNG
 ]
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -58,6 +62,27 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
 
     return chunk_records
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_entsog_point_chunk(point_key, from_str, to_str):
+    url = "https://transparency.entsog.eu/api/v1/operationalData.json"
+    params = {
+        'indicator': 'Physical Flow',
+        'from': from_str,
+        'to': to_str,
+        'limit': 5000,
+        'directionKey': 'entry',
+        'pointKey': point_key,
+        'periodType': 'day'
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json().get('operationalData', [])
+    except Exception:
+        pass
+    return []
+
 
 @st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (24kk)...")
 def fetch_full_entsog_entry_history():
@@ -73,10 +98,16 @@ def fetch_full_entsog_entry_history():
 
     all_data = []
 
-    # Haetaan kaikkien kolmen maan TSO-operaattoreiden viralliset tiedot kerralla
+    # 1. Haetaan Baltia operaattoripohjaisesti
     for op in OPERATORS:
         for from_str, to_str in date_ranges:
             records = fetch_entsog_operator_chunk(op, from_str, to_str)
+            all_data.extend(records)
+
+    # 2. Haetaan Suomen LNG-terminaalit pistekoodeilla
+    for point_key in FINLAND_POINTS:
+        for from_str, to_str in date_ranges:
+            records = fetch_entsog_point_chunk(point_key, from_str, to_str)
             all_data.extend(records)
 
     df = pd.DataFrame(all_data)
@@ -90,12 +121,30 @@ def fetch_full_entsog_entry_history():
         if 'directionKey' in df.columns:
             df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
+        # Varmistetaan, että otetaan vain päiväkohtaiset kWh/d arvot ja poistetaan duplikaatit
+        unit_col = next((c for c in ['unitKey', 'unit'] if c in df.columns), None)
+        if unit_col:
+            df = df[df[unit_col].astype(str).str.lower().str.contains('kwh/d|energy')]
+
+        # Suodatetaan pois mahdolliset alustavat niminaatiot, jos sarakkeessa on tietoa tyypistä
+        type_col = next((c for c in ['subIndicator', 'item', 'subIndicatorKey'] if c in df.columns), None)
+        if type_col:
+            # Pidetään mukana allokaatiot, mitatut tai tyhjät (jos kenttää ei ole rajattu tarkemmin)
+            valid_mask = df[type_col].astype(str).str.lower().str.contains('allocate|measure|actual|def') | (df[type_col].astype(str) == 'nan')
+            df = df[valid_mask]
+
         date_col_raw = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
         if date_col_raw:
             df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
             
-            # Pidetään vain lopullinen virallinen arvo per piste ja päivä (poistetaan mahdolliset duplikaatit)
-            df = df.drop_duplicates(subset=['pointKey', 'Clean_Date'], keep='first')
+            # Ryhmitellään ja otetaan maksimi/summa per piste ja päivä, jotta duplikaatit poistuvat varmasti
+            df = df.groupby(['pointKey', 'Clean_Date'], as_index=False).agg({
+                'value': 'max',
+                'pointLabel': 'first',
+                'operatorKey': 'first',
+                'operatorLabel': 'first',
+                'directionKey': 'first'
+            })
 
     return df
 
@@ -104,8 +153,7 @@ def classify_entry_flow(row):
     point_label = str(row.get('pointLabel', '')).lower()
     point_key = str(row.get('pointKey', '')).lower()
     operator_label = str(row.get('operatorLabel', '')).lower()
-    operator_key = str(row.get('operatorKey', '')).lower()
-    combined = f"{point_label} {point_key} {operator_label} {operator_key}"
+    combined = f"{point_label} {point_key} {operator_label}"
 
     # 1. Inčukalns-varasto (Latvia)
     if 'incukalns' in combined or 'inčukalns' in combined:
@@ -120,8 +168,8 @@ def classify_entry_flow(row):
     if 'gipl' in combined or 'santaka' in combined or 'poland' in combined:
         return 'GIPL (Poland -> LT)'
 
-    # 4. Inkoo & Hamina LNG / Suomen syöttöpisteet (Gasgrid Finland)
-    if 'fi-tso-0001' in combined or 'itp-00495' in combined or 'itp-00508' in combined or 'inkoo' in combined or 'hamina' in combined or 'fsru' in combined:
+    # 4. Inkoo & Hamina LNG (Suomi - pistekoodit ITP-00495 ja ITP-00508)
+    if 'itp-00495' in combined or 'itp-00508' in combined or 'inkoo' in combined or 'hamina' in combined or 'fsru' in combined:
         return 'Inkoo & Hamina LNG'
 
     return None
