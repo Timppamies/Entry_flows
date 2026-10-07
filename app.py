@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA HAKU ---
+# --- 1. ENTSOG DATA ---
 
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
@@ -25,6 +25,22 @@ FINLAND_POINTS = [
     'ITP-00495', # Inkoo FSRU
     'ITP-00508', # Hamina LNG
 ]
+
+def get_category(row):
+    pk = str(row.get('pointKey', '')).upper()
+    pl = str(row.get('pointLabel', '')).lower()
+    
+    if pk in ['ITP-00495', 'ITP-00508']:
+        return 'Inkoo & Hamina LNG'
+    if 'incukalns' in pl or 'inčukalns' in pl:
+        return 'Inčukalns UGS (Withdrawal)'
+    if 'klaip' in pl or 'independence' in pl or 'kn' in pl:
+        if not ('gipl' in pl or 'santaka' in pl):
+            return 'Klaipėda LNG'
+    if 'gipl' in pl or 'santaka' in pl:
+        return 'GIPL (Poland -> LT)'
+    return None
+
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
@@ -44,7 +60,6 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
             'operatorKey': operator_key,
             'periodType': 'day'
         }
-
         try:
             response = requests.get(url, params=params, timeout=12)
             if response.status_code == 200:
@@ -57,7 +72,6 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
                 break
         except Exception:
             break
-
     return chunk_records
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -68,9 +82,6 @@ def fetch_entsog_point_chunk(point_key, from_str, to_str):
     chunk_records = []
 
     while True:
-        # TÄRKEÄÄ: 'indicator': 'Physical Flow' palautettu kutsuun.
-        # Tämä karsii rajapinnassa satojen tuhansien rivien kapasiteettidatan 
-        # ja palauttaa haun sekunnin murto-osan nopeuteen.
         params = {
             'indicator': 'Physical Flow',
             'from': from_str,
@@ -81,7 +92,6 @@ def fetch_entsog_point_chunk(point_key, from_str, to_str):
             'pointKey': point_key,
             'periodType': 'day'
         }
-
         try:
             response = requests.get(url, params=params, timeout=12)
             if response.status_code == 200:
@@ -94,10 +104,9 @@ def fetch_entsog_point_chunk(point_key, from_str, to_str):
                 break
         except Exception:
             break
-
     return chunk_records
 
-@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa...")
+@st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (24kk)...")
 def fetch_full_entsog_entry_history():
     today = datetime.today()
     first_day_current_month = today.replace(day=1)
@@ -123,37 +132,48 @@ def fetch_full_entsog_entry_history():
     if df.empty:
         return df
 
-    # Varmistetaan numeroarvot
+    # Varmistetaan luvut
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
     
-    # Haetaan päivämäärä
+    # Suodatetaan roskat
+    if 'periodType' in df.columns:
+        df = df[df['periodType'].astype(str).str.lower() == 'day']
+    if 'directionKey' in df.columns:
+        df = df[df['directionKey'].astype(str).str.lower() == 'entry']
+    if 'indicator' in df.columns:
+        df = df[df['indicator'].astype(str).str.lower() == 'physical flow']
+
+    # Poimitaan päivämäärä
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     
-    # Luokittelufunktio
-    def get_category(row):
-        pk = str(row.get('pointKey', '')).upper()
-        pl = str(row.get('pointLabel', '')).lower()
-        
-        if pk in ['ITP-00495', 'ITP-00508']:
-            return 'Inkoo & Hamina LNG'
-        if 'incukalns' in pl or 'inčukalns' in pl:
-            return 'Inčukalns UGS (Withdrawal)'
-        if 'klaip' in pl or 'independence' in pl or 'kn' in pl:
-            if not ('gipl' in pl or 'santaka' in pl):
-                return 'Klaipėda LNG'
-        if 'gipl' in pl or 'santaka' in pl:
-            return 'GIPL (Poland -> LT)'
-        return None
-
+    # Luokitellaan maantieteellisesti
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- RATKAISEVA DUPLIKAATTIEN POISTO ---
-    # Tämä estää lukujen moninkertaistumisen. Jos sama fyysinen virta on ilmoitettu
-    # päivän aikana kahden eri operaattorin toimesta, ryhmittely pisteen ja päivän
-    # mukaan ja .max() -arvon ottaminen sulattaa rinnakkaiset mittaukset yhdeksi oikeaksi luvuksi.
-    df_clean = df.groupby(['Category', 'pointKey', 'Date'], as_index=False)['value'].max()
+    # --- ÄLYKÄS DUPLIKAATTIEN PURKU (Estää Inkoon 6 TWh:n maksimikapasiteettivirheen) ---
+    # Ryhmitellään pisteen, päivän ja operaattorin mukaan ottaen kunkin operaattorin ilmoittama suurin luku
+    df_ops = df.groupby(['Category', 'pointKey', 'Date', 'operatorKey'], dropna=False, as_index=False)['value'].max()
+
+    valid_tsos = ['FI-TSO-0001', 'LV-TSO-0001', 'LT-TSO-0001']
+
+    def pick_best_operator(group):
+        # 1. Ensisijaisesti virallisen TSO:n (esim. Gasgrid) luvut (nämä ovat aina todellisia virtoja, eivät kapasiteetteja)
+        tso_rows = group[group['operatorKey'].astype(str).str.upper().isin(valid_tsos)]
+        if not tso_rows.empty:
+            return tso_rows.loc[tso_rows['value'].idxmax()]
+        
+        # 2. Jos TSO:ta ei löydy, valitaan pienin nollasta poikkeava luku
+        # (Tämä skippaa LNG-operaattoreiden ilmoittaman 140 GWh:n kapasiteetin ja poimii 16 GWh:n toteutuman)
+        pos_rows = group[group['value'] > 0]
+        if not pos_rows.empty:
+            return pos_rows.loc[pos_rows['value'].idxmin()]
+        
+        # 3. Jos kaikki on nollia
+        return group.iloc[0]
+
+    # Ajetaan älykäs suodatus ja poistetaan näin kaikki duplikaatit lopullisesti
+    df_clean = df_ops.groupby(['Category', 'pointKey', 'Date'], as_index=False).apply(pick_best_operator).reset_index(drop=True)
 
     return df_clean
 
