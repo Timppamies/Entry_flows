@@ -29,7 +29,7 @@ def get_category(row):
     if 'gipl' in pl or 'santaka' in pl: return 'GIPL (Poland -> LT)'
     return None
 
-@st.cache_data(ttl=3600, show_spinner="Noudetaan dataa ENTSOG-rajapinnasta...")
+@st.cache_data(ttl=3600, show_spinner="Noudetaan dataa ENTSOG-rajapinnasta (noin 10 sekuntia)...")
 def fetch_fast_entsog_data():
     today = datetime.today()
     start_dt = (today.replace(day=1) - timedelta(days=24 * 31)).replace(day=1)
@@ -72,11 +72,12 @@ def fetch_fast_entsog_data():
                     'indicator': 'Physical Flow', 'from': d_start, 'to': d_end,
                     'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
                 })
-            # 2. Suomi (Inkoo, Hamina)
-            fetch_api({
-                'indicator': 'Physical Flow', 'from': d_start, 'to': d_end,
-                'directionKey': 'entry', 'pointKey': 'ITP-00495,ITP-00508', 'periodType': 'day'
-            })
+            # 2. Suomi (Inkoo, Hamina) - Haetaan molemmat indikaattorit varmuuden vuoksi
+            for ind in ['Physical Flow', 'Allocation']:
+                fetch_api({
+                    'indicator': ind, 'from': d_start, 'to': d_end,
+                    'directionKey': 'entry', 'pointKey': 'ITP-00495,ITP-00508', 'periodType': 'day'
+                })
 
     df = pd.DataFrame(all_data)
     return df
@@ -101,33 +102,44 @@ if df_raw.empty:
 else:
     df = df_raw.copy()
     
-    # Perussiivous
+    # Varmistetaan luvut ja suodatetaan vain päivätason entry-virrat
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
     df = df[df['periodType'].astype(str).str.lower() == 'day']
     df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
+    # --- TÄRKEIN KORJAUS 1: YKSIKKÖSKAALAUS ---
+    # Koska Gasgrid ilmoittaa Suomen päivätason virtauksen virheellisesti yksikössä kWh/h, 
+    # se on pakko kertoa 24:llä, jotta saadaan todellinen päiväenergia!
+    if 'unit' in df.columns:
+        df['unit_low'] = df['unit'].astype(str).str.lower()
+        hourly_mask = df['unit_low'].str.contains('kwh/h')
+        df.loc[hourly_mask, 'value'] = df.loc[hourly_mask, 'value'] * 24
+
+    # Määritetään päivämäärät ja kategoriat
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- SUOMEN DATAN PUHDISTUS: Vektoroitu Kapasiteettileikkuri ---
-    # Tämä on puhdas ja salamannopea tapa nollata yli-isot luvut ilman apply()-virheitä.
-    df['clean_value'] = df['value']
-    
-    # Leikataan Inkoon maksimikapasiteetti (n. 140 GWh) pois.
-    is_inkoo = df['pointKey'].astype(str).str.upper() == 'ITP-00495'
-    df.loc[is_inkoo & (df['value'] > 130000000), 'clean_value'] = 0.0
-    
-    # Leikataan Haminan maksimikapasiteetti (n. 40 GWh) pois.
-    is_hamina = df['pointKey'].astype(str).str.upper() == 'ITP-00508'
-    df.loc[is_hamina & (df['value'] > 35000000), 'clean_value'] = 0.0
+    # --- TÄRKEIN KORJAUS 2: VEKTOROITU KAPASITEETTILEIKKURI ---
+    # Nyt kun todellinen virta on skaalattu oikeaksi (esim. 16 GWh), 
+    # voimme turvallisesti ampua terminaalien raportoimat valtavat maksimikapasiteetit nollaksi.
+    def cut_capacity(row):
+        pk = str(row['pointKey']).upper()
+        v = row['value']
+        # Leikataan Inkoon maksimikapasiteetti (>120 GWh) pois
+        if pk == 'ITP-00495' and v > 120000000:
+            return 0.0
+        # Leikataan Haminan maksimikapasiteetti (>50 GWh) pois
+        if pk == 'ITP-00508' and v > 50000000:
+            return 0.0
+        return v
+        
+    df['clean_value'] = df.apply(cut_capacity, axis=1)
 
     # --- DUPLIKAATTIEN POISTO PÄIVÄTASOLLA ---
     # Ryhmitellään pisteen ja päivän mukaan ja otetaan maksimiarvo leikatusta datasta.
-    # Jos Inkoossa oli kapasiteettirivi (nyt 0) ja todellinen rivi (esim. 16 milj. kWh),
-    # maksimi valitsee oikein sen 16 milj. kWh. 
-    # Jos terminaali on kiinni, kaikki rivit ovat 0, ja max valitsee oikein 0.
+    # Kapasiteettirivi (muutettu 0:ksi) häviää oikealle yksikkökorjatulle virtaukselle (esim. 16 milj. kWh).
     df_daily = df.groupby(['Date', 'Category', 'pointKey'], as_index=False)['clean_value'].max()
     df_daily.rename(columns={'clean_value': 'value'}, inplace=True)
     
