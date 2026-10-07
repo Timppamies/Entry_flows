@@ -169,13 +169,14 @@ else:
     latest_month = df_display.index[-1]
     latest_total = df_display.loc[latest_month].sum()
 
+    # --- KÄYTTÖLIITTYMÄN PIIRTÄMINEN ---
     st.subheader(f"Latest Month Overview ({latest_month})")
     m_cols = st.columns(len(categories_order) + 1)
 
-    m_cols[0].metric(label="Total Supply", value=f"{latest_total:.3f} TWh")
+    m_cols[0].metric(label="Total Supply", value=f"{latest_total:.1f} TWh")
     for idx, col in enumerate(categories_order):
         val = df_display.loc[latest_month, col]
-        m_cols[idx + 1].metric(label=col, value=f"{val:.3f} TWh")
+        m_cols[idx + 1].metric(label=col, value=f"{val:.1f} TWh")
 
     st.markdown("---")
 
@@ -194,6 +195,8 @@ else:
         color_discrete_sequence=px.colors.qualitative.Set2
     )
 
+    # Pyöristetään myös kaavion hover-tekstit yhteen desimaaliin
+    fig.update_traces(texttemplate='%{y:.1f}', textposition='none')
     fig.update_layout(
         barmode='stack',
         xaxis_tickangle=-45,
@@ -201,6 +204,7 @@ else:
         height=500,
         hovermode="x unified"
     )
+    fig.update_yaxes(tickformat=".1f")
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -208,12 +212,12 @@ else:
     display_df = df_display.copy()
     display_df['Total (TWh)'] = display_df.sum(axis=1)
 
-    st.dataframe(display_df.style.format("{:.3f}"), use_container_width=True)
+    # Taulukon luvut pyöristettynä yhteen desimaaliin
+    st.dataframe(display_df.style.format("{:.1f}"), use_container_width=True)
 
     csv_data = display_df.to_csv().encode('utf-8')
     st.download_button(
         label="Download Data as CSV 📥",
         data=csv_data,
         file_name=f"finbalt_gas_entry_flows_{latest_month}.csv",
-        mime="text/csv"
-    )
+        mime="
