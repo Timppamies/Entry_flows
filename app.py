@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: KAPASITEETIN SUODATUS JA OIKEAT FYYSISET VIRRAT ---
+# --- 1. ENTSOG DATA: PÄIVÄKOHTAINEN AGGREGONTI JA DUPLIKAATTIEN ESTO ---
 
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
@@ -112,37 +112,33 @@ def fetch_full_entsog_entry_history():
 
     df = pd.DataFrame(all_data)
     
-    # --- TIUKKA SUODATUS: POISTETAAN KAPASITEETIT JA SÄILYTETÄÄN VAIN FYYSISET VIRRAT ---
+    # --- PUHDISTUS JA PÄIVÄKOHTAINEN UNIKOINTI ---
     if not df.empty:
+        df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
+
         if 'periodType' in df.columns:
             df = df[df['periodType'].astype(str).str.lower() == 'day']
             
         if 'directionKey' in df.columns:
             df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-        # Poistetaan kaikki rivit, joiden subIndicator tai item viittaa kapasiteettiin tai varauksiin
+        # Poistetaan kapasiteettiin viittaavat rivit
         for col in ['subIndicator', 'item', 'subIndicatorKey']:
             if col in df.columns:
-                mask = ~df[col].astype(str).str.lower().str.contains('capacity|firm|interruptible|booking')
+                mask = ~df[col].astype(str).str.lower().str.contains('capacity|firm|interruptible|booking|nomination|allocation')
                 df = df[mask]
-
-        # Varmistetaan versio- ja statuskarsinta
-        if 'statusKey' in df.columns:
-            actual_df = df[df['statusKey'].astype(str).str.lower() == 'actual']
-            if not actual_df.empty:
-                df = actual_df
-
-        if 'version' in df.columns:
-            df['version'] = pd.to_numeric(df['version'], errors='coerce').fillna(0)
-            df = df.sort_values('version', ascending=False)
 
         date_col_raw = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
         if date_col_raw:
             df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
-            df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
             
-            # Poistetaan duplikaatit pistekohtaisesti per päivä
-            df = df.drop_duplicates(subset=['pointKey', 'Clean_Date'], keep='first')
+            # KRITTINEN KORJAUS: Ryhmitellään pisteen ja päivän mukaan ja otetaan maksimiarvo.
+            # Tämä estää sen, että ENTSOG:n palauttamat rinnakkaiset mittaukset/versiot moninkertaistavat summan.
+            group_cols = ['pointKey', 'Clean_Date', 'pointLabel', 'operatorKey', 'operatorLabel']
+            existing_group_cols = [c for c in group_cols if c in df.columns]
+            
+            if existing_group_cols:
+                df = df.groupby(existing_group_cols, as_index=False)['value'].max()
 
     return df
 
@@ -196,15 +192,11 @@ else:
     if df_filtered.empty:
         st.warning("Syöttövirtoja ei löytynyt annetulta aikaväliltä.")
     else:
-        date_candidates = ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn']
-        date_col = next((c for c in date_candidates if c in df_filtered.columns), None)
-        if not date_col:
-            date_col = next((c for c in df_filtered.columns if 'period' in c.lower() or 'date' in c.lower()), None)
-
-        df_filtered['value'] = pd.to_numeric(df_filtered['value'], errors='coerce').fillna(0)
-        df_filtered['Date_Parsed'] = pd.to_datetime(df_filtered[date_col], utc=True)
+        # Muutetaan Clean_Date takaisin päivämääräksi kuukausittaista ryhmittelyä varten
+        df_filtered['Date_Parsed'] = pd.to_datetime(df_filtered['Clean_Date'], utc=True)
         df_filtered['Month'] = df_filtered['Date_Parsed'].dt.strftime('%Y-%m')
 
+        # Aggregointi kuukausitasolle (kWh -> TWh muunnos: / 1e9)
         monthly_summary = df_filtered.groupby(['Month', 'Category'])['value'].sum().reset_index()
         monthly_summary['Value_TWh'] = monthly_summary['value'] / 1e9
 
@@ -227,6 +219,7 @@ else:
         latest_month = df_display.index[-1]
         latest_total = df_display.loc[latest_month].sum()
 
+        # --- Yhteenvetokortit (Metrics) ---
         st.subheader(f"Latest Month Overview ({latest_month})")
         m_cols = st.columns(len(categories_order) + 1)
 
@@ -237,7 +230,9 @@ else:
 
         st.markdown("---")
 
+        # --- Plotly Pylväskaavio ---
         st.subheader("Monthly Gas Supply by Route (TWh)")
+
         plot_df = df_display.reset_index().melt(id_vars='Month', var_name='Entry Route', value_name='TWh')
 
         fig = px.bar(
@@ -261,6 +256,7 @@ else:
 
         st.plotly_chart(fig, use_container_width=True)
 
+        # --- Taulukko & CSV-lataus ---
         st.subheader("Data Summary Table")
         display_df = df_display.copy()
         display_df['Total (TWh)'] = display_df.sum(axis=1)
@@ -272,5 +268,5 @@ else:
             label="Download Data as CSV 📥",
             data=csv_data,
             file_name=f"finbalt_gas_entry_flows_{latest_month}.csv",
-            mime="text/csv"
+            mime="text/css"
         )
