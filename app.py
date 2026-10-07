@@ -14,12 +14,16 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: PUHASTAJA JA NOPEA OPERAATTORIHAKU ---
+# --- 1. ENTSOG DATA: KOHDENNETTU JA OIKEIN SKAALAUTUVA HAKU ---
 
 OPERATORS = [
-    'FI-TSO-0001', # Gasgrid Finland
-    'LV-TSO-0001', # Conexus Baltic Grid
-    'LT-TSO-0001', # Amber Grid
+    'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
+    'LT-TSO-0001', # Amber Grid (Klaipėda, GIPL)
+]
+
+FINLAND_POINTS = [
+    'ITP-00495', # Inkoo FSRU
+    'ITP-00508', # Hamina LNG
 ]
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -58,6 +62,27 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
 
     return chunk_records
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_entsog_point_chunk(point_key, from_str, to_str):
+    url = "https://transparency.entsog.eu/api/v1/operationalData.json"
+    params = {
+        'indicator': 'Physical Flow',
+        'from': from_str,
+        'to': to_str,
+        'limit': 5000,
+        'directionKey': 'entry',
+        'pointKey': point_key,
+        'periodType': 'day'
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json().get('operationalData', [])
+    except Exception:
+        pass
+    return []
+
 
 @st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (24kk)...")
 def fetch_full_entsog_entry_history():
@@ -73,34 +98,38 @@ def fetch_full_entsog_entry_history():
 
     all_data = []
 
+    # 1. Haetaan Baltia operaattoripohjaisesti
     for op in OPERATORS:
         for from_str, to_str in date_ranges:
             records = fetch_entsog_operator_chunk(op, from_str, to_str)
             all_data.extend(records)
 
+    # 2. Haetaan Inkoo ja Hamina puhtaasti pistekoodeilla
+    for point_key in FINLAND_POINTS:
+        for from_str, to_str in date_ranges:
+            records = fetch_entsog_point_chunk(point_key, from_str, to_str)
+            all_data.extend(records)
+
     df = pd.DataFrame(all_data)
     
-    # Tarkka duplikaattien ja virheellisten rivien siivous
+    # Tiukka puhdistus ja duplikaattien esto: varmistetaan, että samaa päivää ei lasketa kahteen kertaan
     if not df.empty:
         if 'periodType' in df.columns:
             df = df[df['periodType'].astype(str).str.lower() == 'day']
         
-        # Poistetaan kaksoiskappaleet dynaamisesti
-        subset_cols = [c for c in ['pointKey', 'periodFrom', 'directionKey', 'value', 'operatorKey'] if c in df.columns]
+        # Poistetaan kaksoiskappaleet pointKeyn ja alkupäivän mukaan
+        subset_cols = [c for c in ['pointKey', 'periodFrom', 'directionKey'] if c in df.columns]
         if subset_cols:
-            df = df.drop_duplicates(subset=subset_cols)
+            df = df.drop_duplicates(subset=subset_cols, keep='first')
 
     return df
 
 
 def classify_entry_flow(row):
-    """
-    Tarkka luokittelu ilman lukujen kertaantumista.
-    """
     point_label = str(row.get('pointLabel', '')).lower()
-    operator_key = str(row.get('operatorKey', '')).upper()
+    point_key = str(row.get('pointKey', '')).lower()
     operator_label = str(row.get('operatorLabel', '')).lower()
-    combined = f"{point_label} {operator_label}"
+    combined = f"{point_label} {point_key} {operator_label}"
 
     # 1. Inčukalns-varasto (Latvia)
     if 'incukalns' in combined or 'inčukalns' in combined:
@@ -115,11 +144,8 @@ def classify_entry_flow(row):
     if 'gipl' in combined or 'santaka' in combined or 'poland' in combined:
         return 'GIPL (Poland -> LT)'
 
-    # 4. Inkoo & Hamina LNG (Suomi / Gasgrid FI-TSO-0001 ulkoinen tuonti)
-    if operator_key == 'FI-TSO-0001':
-        # Varmistetaan, ettei oteta sisäverkon siirtoja tai tasevirtoja mukaan
-        if 'balancing' in combined or 'storage' in combined:
-            return None
+    # 4. Inkoo & Hamina LNG (Suomi - pistekoodit ITP-00495 ja ITP-00508)
+    if 'itp-00495' in combined or 'itp-00508' in combined or 'inkoo' in combined or 'hamina' in combined or 'fsru' in combined:
         return 'Inkoo & Hamina LNG'
 
     return None
@@ -157,7 +183,6 @@ else:
         df_filtered['Date_Parsed'] = pd.to_datetime(df_filtered[date_col], utc=True)
         df_filtered['Month'] = df_filtered['Date_Parsed'].dt.strftime('%Y-%m')
 
-        # Aggregointi kuukausitasolle (kWh -> TWh muunnos: / 1e9)
         monthly_summary = df_filtered.groupby(['Month', 'Category'])['value'].sum().reset_index()
         monthly_summary['Value_TWh'] = monthly_summary['value'] / 1e9
 
