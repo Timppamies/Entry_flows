@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. BALTIAN HAKU (ENTSOG) ---
+# --- 1. BALTIAN HAKU (ENTSOG - mukana 2025 alkuvuoden poikkeuslogiikka) ---
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid
     'LT-TSO-0001', # Amber Grid
@@ -68,14 +68,16 @@ def fetch_baltic_data():
 
         for d_start, d_end in date_ranges:
             for op in OPERATORS:
-                fetch_api({
-                    'indicator': 'Physical Flow', 
-                    'from': d_start, 
-                    'to': d_end,
-                    'directionKey': 'entry', 
-                    'operatorKey': op, 
-                    'periodType': 'day'
-                })
+                # Haetaan varmuuden vuoksi molemmat suunnat, jotta poikkeus saadaan kiinni
+                for dir_key in ['entry', 'exit']:
+                    fetch_api({
+                        'indicator': 'Physical Flow', 
+                        'from': d_start, 
+                        'to': d_end,
+                        'directionKey': dir_key, 
+                        'operatorKey': op, 
+                        'periodType': 'day'
+                    })
 
     df = pd.DataFrame(all_data)
     if df.empty:
@@ -83,12 +85,23 @@ def fetch_baltic_data():
         
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
     df = df[df['periodType'].astype(str).str.lower() == 'day']
-    df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     df['Category'] = df.apply(get_baltic_category, axis=1)
     df = df.dropna(subset=['Category'])
+    
+    df['Month'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m')
+    df['dir'] = df['directionKey'].astype(str).str.lower()
+
+    # Puhdas ja täsmällinen poikkeussuodatus:
+    # 1. Inčukalns UGS: tammi-maaliskuu 2025 otetaan 'exit'-suunnasta, muut kuukaudet 'entry'-suunnasta.
+    # 2. Muut kategoriat (LNG, GIPL): aina 'entry'-suunnasta.
+    is_incukalns_early_2025 = (df['Category'] == 'Inčukalns UGS (Withdrawal)') & (df['Month'].isin(['2025-01', '2025-02', '2025-03'])) & (df['dir'] == 'exit')
+    is_incukalns_normal = (df['Category'] == 'Inčukalns UGS (Withdrawal)') & (~df['Month'].isin(['2025-01', '2025-02', '2025-03'])) & (df['dir'] == 'entry')
+    is_other_routes = (df['Category'] != 'Inčukalns UGS (Withdrawal)') & (df['dir'] == 'entry')
+
+    df = df[is_incukalns_early_2025 | is_incukalns_normal | is_other_routes]
 
     df_daily = df.groupby(['Date', 'Category', 'pointKey'], as_index=False)['value'].max()
     df_daily['Date_Parsed'] = pd.to_datetime(df_daily['Date'])
