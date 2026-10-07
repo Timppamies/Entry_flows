@@ -14,9 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: NOPEA HAKU ---
-
-OPERATORS = ['LV-TSO-0001', 'LT-TSO-0001']
+# --- 1. ENTSOG DATA: NOPEA HAKU VÄLIMUISTILLA ---
 
 def get_category(row):
     pk = str(row.get('pointKey', '')).upper()
@@ -29,7 +27,7 @@ def get_category(row):
     if 'gipl' in pl or 'santaka' in pl: return 'GIPL (Poland -> LT)'
     return None
 
-@st.cache_data(ttl=3600, show_spinner="Noudetaan dataa ENTSOG-rajapinnasta (noin 10 sekuntia)...")
+@st.cache_data(ttl=3600, show_spinner="Noudetaan dataa ENTSOG-rajapinnasta (kestää noin 10-15 sekuntia)...")
 def fetch_fast_entsog_data():
     today = datetime.today()
     start_dt = (today.replace(day=1) - timedelta(days=24 * 31)).replace(day=1)
@@ -66,13 +64,13 @@ def fetch_fast_entsog_data():
                     break
 
         for d_start, d_end in date_ranges:
-            # 1. Baltia (Klaipeda, GIPL, Incukalns)
-            for op in OPERATORS:
+            # 1. Baltia (Pelkkä Physical Flow on heille luotettava)
+            for op in ['LV-TSO-0001', 'LT-TSO-0001']:
                 fetch_api({
                     'indicator': 'Physical Flow', 'from': d_start, 'to': d_end,
                     'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
                 })
-            # 2. Suomi (Inkoo, Hamina) - Haetaan molemmat indikaattorit varmuuden vuoksi
+            # 2. Suomi (Haetaan Allocation JA Physical Flow, jotta mikään aito virtauspäivä ei katoa)
             for ind in ['Physical Flow', 'Allocation']:
                 fetch_api({
                     'indicator': ind, 'from': d_start, 'to': d_end,
@@ -102,51 +100,41 @@ if df_raw.empty:
 else:
     df = df_raw.copy()
     
-    # Varmistetaan luvut ja suodatetaan vain päivätason entry-virrat
+    # Varmistetaan luvut
     df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
     df = df[df['periodType'].astype(str).str.lower() == 'day']
     df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-    # --- TÄRKEIN KORJAUS 1: YKSIKKÖSKAALAUS ---
-    # Koska Gasgrid ilmoittaa Suomen päivätason virtauksen virheellisesti yksikössä kWh/h, 
-    # se on pakko kertoa 24:llä, jotta saadaan todellinen päiväenergia!
-    if 'unit' in df.columns:
-        df['unit_low'] = df['unit'].astype(str).str.lower()
-        hourly_mask = df['unit_low'].str.contains('kwh/h')
-        df.loc[hourly_mask, 'value'] = df.loc[hourly_mask, 'value'] * 24
-
-    # Määritetään päivämäärät ja kategoriat
+    # Kategoriat ja päivämäärät
     date_col = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart'] if c in df.columns), 'periodFrom')
     df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.date
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- TÄRKEIN KORJAUS 2: VEKTOROITU KAPASITEETTILEIKKURI ---
-    # Nyt kun todellinen virta on skaalattu oikeaksi (esim. 16 GWh), 
-    # voimme turvallisesti ampua terminaalien raportoimat valtavat maksimikapasiteetit nollaksi.
-    def cut_capacity(row):
-        pk = str(row['pointKey']).upper()
-        v = row['value']
-        # Leikataan Inkoon maksimikapasiteetti (>120 GWh) pois
-        if pk == 'ITP-00495' and v > 120000000:
-            return 0.0
-        # Leikataan Haminan maksimikapasiteetti (>50 GWh) pois
-        if pk == 'ITP-00508' and v > 50000000:
-            return 0.0
-        return v
-        
-    df['clean_value'] = df.apply(cut_capacity, axis=1)
-
-    # --- DUPLIKAATTIEN POISTO PÄIVÄTASOLLA ---
-    # Ryhmitellään pisteen ja päivän mukaan ja otetaan maksimiarvo leikatusta datasta.
-    # Kapasiteettirivi (muutettu 0:ksi) häviää oikealle yksikkökorjatulle virtaukselle (esim. 16 milj. kWh).
-    df_daily = df.groupby(['Date', 'Category', 'pointKey'], as_index=False)['clean_value'].max()
-    df_daily.rename(columns={'clean_value': 'value'}, inplace=True)
+    # --- TÄRKEIN LOGIIKKA: KAPASITEETTILEIKKURI (Bugin tuhoaja) ---
+    is_inkoo = (df['pointKey'].astype(str).str.upper() == 'ITP-00495')
+    is_hamina = (df['pointKey'].astype(str).str.upper() == 'ITP-00508')
+    
+    # Tunnistetaan tekniset maksimikapasiteetit. 
+    # Inkoon kapasiteetti on n. 140 GWh -> Leikataan kaikki > 100 GWh
+    # Haminan kapasiteetti on n. 40 GWh -> Leikataan kaikki > 30 GWh
+    mask_cap_inkoo = is_inkoo & (df['value'] >= 100000000)
+    mask_cap_hamina = is_hamina & (df['value'] >= 30000000)
+    
+    # TIPUTETAAN valtavat kapasiteettirivit KOKONAAN pois DataFrame:sta!
+    df_real = df[~(mask_cap_inkoo | mask_cap_hamina)].copy()
+    
+    # --- PÄIVÄTASON AGGREGOINTI ---
+    # Nyt kun kapasiteetit on tuhottu, jäljellä on vain oikeita virtauksia (esim. 16 milj. kWh ja nollia).
+    # Ryhmitellään piste ja päivä, ja otetaan näistä MAKSIMI.
+    # Tämä yhdistää Allocationin ja Physical Flow'n tiedot oikein siten, että todellinen virta poimitaan aina!
+    df_daily = df_real.groupby(['Date', 'Category', 'pointKey'], as_index=False)['value'].max()
     
     # --- KUUKAUSITASON AGGREGOINTI ---
     df_daily['Date_Parsed'] = pd.to_datetime(df_daily['Date'])
     df_daily['Month'] = df_daily['Date_Parsed'].dt.strftime('%Y-%m')
 
+    # Nyt koodi summaa kuukaudelta VAIN nuo puhdistetut 16 GWh päivävirrat, jolloin tulos asettuu odotettuun 0.5 - 1.0 TWh -mittakaavaan!
     monthly_summary = df_daily.groupby(['Month', 'Category'])['value'].sum().reset_index()
     monthly_summary['Value_TWh'] = monthly_summary['value'] / 1e9
 
