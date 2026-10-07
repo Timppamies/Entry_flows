@@ -14,16 +14,12 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: AITO SUODATUS ALAINDIKAATTOREIDEN MUKAAN ---
+# --- 1. ENTSOG DATA: OPERAATTORIPOHJAINEN HAKU (FI, LV, LT) ---
 
 OPERATORS = [
+    'FI-TSO-0001', # Gasgrid Finland (Inkoo, Hamina, Baltconnector ym.)
     'LV-TSO-0001', # Conexus Baltic Grid (Inčukalns)
     'LT-TSO-0001', # Amber Grid (Klaipėda, GIPL)
-]
-
-FINLAND_POINTS = [
-    'ITP-00495', # Inkoo FSRU
-    'ITP-00508', # Hamina LNG
 ]
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -62,27 +58,6 @@ def fetch_entsog_operator_chunk(operator_key, from_str, to_str):
 
     return chunk_records
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_entsog_point_chunk(point_key, from_str, to_str):
-    url = "https://transparency.entsog.eu/api/v1/operationalData.json"
-    params = {
-        'indicator': 'Physical Flow',
-        'from': from_str,
-        'to': to_str,
-        'limit': 5000,
-        'directionKey': 'entry',
-        'pointKey': point_key,
-        'periodType': 'day'
-    }
-
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
-            return response.json().get('operationalData', [])
-    except Exception:
-        pass
-    return []
-
 
 @st.cache_data(ttl=86400, show_spinner="Ladataan FinBalt gas entry -historiaa (24kk)...")
 def fetch_full_entsog_entry_history():
@@ -98,14 +73,10 @@ def fetch_full_entsog_entry_history():
 
     all_data = []
 
+    # Haetaan kaikkien kolmen maan TSO-operaattoreiden viralliset tiedot kerralla
     for op in OPERATORS:
         for from_str, to_str in date_ranges:
             records = fetch_entsog_operator_chunk(op, from_str, to_str)
-            all_data.extend(records)
-
-    for point_key in FINLAND_POINTS:
-        for from_str, to_str in date_ranges:
-            records = fetch_entsog_point_chunk(point_key, from_str, to_str)
             all_data.extend(records)
 
     df = pd.DataFrame(all_data)
@@ -119,23 +90,11 @@ def fetch_full_entsog_entry_history():
         if 'directionKey' in df.columns:
             df = df[df['directionKey'].astype(str).str.lower() == 'entry']
 
-        # --- AITO TIETOJEN PUHDISTUS ILMAN KORJAUSKERTOIMIA ---
-        # ENTSOG palauttaa pisteille useita eri rivejä (Nomination, Allocation, Measured jne.).
-        # Etsitään kenttä, joka määrittää tietueen tyypin (yleensä subIndicator tai item).
-        # Haluamme mukaan vain virallisen lopullisen allokaation tai mitatun fysikaalisen virran.
-        type_col = next((c for c in ['subIndicator', 'item', 'subIndicatorKey', 'statusKey'] if c in df.columns), None)
-        
-        if type_col:
-            # Poistetaan niminaatiot ja alustavat ennusteet, pidetään vain toteutuneet (Allocated / Measured / Actual)
-            mask = df[type_col].astype(str).str.lower().str.contains('allocate|measure|actual|def')
-            if mask.sum() > 0:
-                df = df[mask]
-
         date_col_raw = next((c for c in ['periodFrom', 'gasDayStart', 'periodStart', 'gasDayStartedOn'] if c in df.columns), None)
         if date_col_raw:
             df['Clean_Date'] = pd.to_datetime(df[date_col_raw], utc=True).dt.date
             
-            # Varmistetaan että jokaisella pisteellä on tasan yksi arvo per vuorokausi
+            # Pidetään vain lopullinen virallinen arvo per piste ja päivä (poistetaan mahdolliset duplikaatit)
             df = df.drop_duplicates(subset=['pointKey', 'Clean_Date'], keep='first')
 
     return df
@@ -145,19 +104,24 @@ def classify_entry_flow(row):
     point_label = str(row.get('pointLabel', '')).lower()
     point_key = str(row.get('pointKey', '')).lower()
     operator_label = str(row.get('operatorLabel', '')).lower()
-    combined = f"{point_label} {point_key} {operator_label}"
+    operator_key = str(row.get('operatorKey', '')).lower()
+    combined = f"{point_label} {point_key} {operator_label} {operator_key}"
 
+    # 1. Inčukalns-varasto (Latvia)
     if 'incukalns' in combined or 'inčukalns' in combined:
         return 'Inčukalns UGS (Withdrawal)'
 
+    # 2. Klaipėda LNG (Liettua)
     if 'klaip' in combined or 'independence' in combined or 'kn' in combined:
         if not ('gipl' in combined or 'santaka' in combined):
             return 'Klaipėda LNG'
 
+    # 3. GIPL (Puola -> Liettua)
     if 'gipl' in combined or 'santaka' in combined or 'poland' in combined:
         return 'GIPL (Poland -> LT)'
 
-    if 'itp-00495' in combined or 'itp-00508' in combined or 'inkoo' in combined or 'hamina' in combined or 'fsru' in combined:
+    # 4. Inkoo & Hamina LNG / Suomen syöttöpisteet (Gasgrid Finland)
+    if 'fi-tso-0001' in combined or 'itp-00495' in combined or 'itp-00508' in combined or 'inkoo' in combined or 'hamina' in combined or 'fsru' in combined:
         return 'Inkoo & Hamina LNG'
 
     return None
