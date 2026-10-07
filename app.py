@@ -14,7 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. ENTSOG DATA: NOPEA HAKU JA KAPASITEETTILEIKKURI ---
+# --- 1. ENTSOG DATA: NOPEA HAKU JA VEKTOROITU KAPASITEETTILEIKKURI ---
 
 OPERATORS = [
     'LV-TSO-0001', # Conexus Baltic Grid
@@ -49,6 +49,12 @@ def fetch_and_clean_entsog_data():
     from_str = start_dt.strftime('%Y-%m-%d')
     to_str = today.strftime('%Y-%m-%d')
     
+    # Jaetaan varalta kahteen hakuun, jotta API ei pätki
+    date_ranges = [
+        (from_str, (start_dt + timedelta(days=365)).strftime('%Y-%m-%d')),
+        (((start_dt + timedelta(days=365+1)).strftime('%Y-%m-%d')), to_str)
+    ]
+    
     all_data = []
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
     
@@ -71,18 +77,19 @@ def fetch_and_clean_entsog_data():
                 except Exception:
                     break
 
-        # 1. Baltia
-        for op in OPERATORS:
+        for d_start, d_end in date_ranges:
+            # 1. Baltia
+            for op in OPERATORS:
+                fetch_api({
+                    'indicator': 'Physical Flow', 'from': d_start, 'to': d_end,
+                    'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
+                })
+                
+            # 2. Suomi
             fetch_api({
-                'indicator': 'Physical Flow', 'from': from_str, 'to': to_str,
-                'directionKey': 'entry', 'operatorKey': op, 'periodType': 'day'
+                'indicator': 'Physical Flow', 'from': d_start, 'to': d_end,
+                'directionKey': 'entry', 'pointKey': 'ITP-00495,ITP-00508', 'periodType': 'day'
             })
-            
-        # 2. Suomi
-        fetch_api({
-            'indicator': 'Physical Flow', 'from': from_str, 'to': to_str,
-            'directionKey': 'entry', 'pointKey': 'ITP-00495,ITP-00508', 'periodType': 'day'
-        })
 
     df = pd.DataFrame(all_data)
     if df.empty:
@@ -98,37 +105,28 @@ def fetch_and_clean_entsog_data():
     df['Category'] = df.apply(get_category, axis=1)
     df = df.dropna(subset=['Category'])
 
-    # --- KAPASITEETTILEIKKURI (Bugin selättäjä) ---
-    def process_daily_flow(group):
-        cat = group['Category'].iloc[0]
-        
-        # BALTIA: Data on luotettavaa, otetaan suurin arvo (estää haamunollat)
-        if cat != 'Inkoo & Hamina LNG':
-            return group['value'].max()
-            
-        # SUOMI: Leikataan ENTSOGin syöttämät maksimikapasiteetit irti datasta
-        pk = str(group['pointKey'].iloc[0]).upper()
-        
-        # Asetetaan kynnysarvot (kWh/d), joiden ylittävät luvut ovat satavarmasti kapasiteettia
-        # Inkoon kapasiteetti on n. 140 GWh/d, leikataan kaikki yli 130 GWh/d
-        # Haminan kapasiteetti on n. 40 GWh/d, leikataan kaikki yli 35 GWh/d
-        cap_threshold = 130000000 if pk == 'ITP-00495' else 35000000
-        
-        # Suodatetaan kapasiteettirivit pois
-        actual_flows = group[group['value'] < cap_threshold]
-        
-        if not actual_flows.empty:
-            # Jos jäljelle jäi aitoja virtauksia, palautetaan niistä suurin
-            return actual_flows['value'].max()
-        else:
-            # Jos tarjolla oli VAIN massiivinen kapasiteettirivi, se tarkoittaa, 
-            # että terminaali oli kiinni eikä aitoa virtaa ollut.
+    # --- KAPASITEETTILEIKKURI (Pandas-turvallinen vektoriversio) ---
+    # Tämä estää KeyErrorin ja tuhoaa ENTSOGin syöttämät maksimikapasiteetit lennosta.
+    def cap_cutter(row):
+        pk = str(row['pointKey']).upper()
+        v = row['value']
+        # Jos Inkoon lukema on yli 130 GWh, se on satavarmasti maksimikapasiteetti, muutetaan nollaksi.
+        if pk == 'ITP-00495' and v > 130000000:
             return 0.0
-
-    # Ajetaan leikkuri jokaiselle pisteelle ja päivälle
-    df_clean = df.groupby(['Category', 'pointKey', 'Date'], as_index=False).apply(
-        lambda g: pd.Series({'value': process_daily_flow(g)})
-    ).reset_index()
+        # Jos Haminan lukema on yli 35 GWh, se on satavarmasti maksimikapasiteetti, muutetaan nollaksi.
+        if pk == 'ITP-00508' and v > 35000000:
+            return 0.0
+        return v
+        
+    df['clean_value'] = df.apply(cap_cutter, axis=1)
+    
+    # Nyt kun kapasiteetit on ammuttu nollaksi, voimme turvallisesti ottaa päivän maksimin.
+    # Jos Inkoosta palasi kapasiteetti (nyt 0) ja todellinen virta (esim. 16M), max on 16M.
+    # Jos terminaali on kiinni, kaikki rivit ovat nollia, jolloin max on 0.
+    df_clean = df.groupby(['Category', 'pointKey', 'Date'], as_index=False)['clean_value'].max()
+    
+    # Palautetaan sarakkeen nimeksi takaisin 'value' UI:ta varten
+    df_clean = df_clean.rename(columns={'clean_value': 'value'})
 
     return df_clean
 
