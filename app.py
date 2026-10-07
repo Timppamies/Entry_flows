@@ -3,7 +3,9 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import plotly.express as px
-import time
+import warnings
+
+warnings.filterwarnings("ignore")
 
 # Sovelluksen sivun asetukset
 st.set_page_config(
@@ -12,88 +14,69 @@ st.set_page_config(
     layout="wide"
 )
 
-# Relevantit ENTSOG-pisteet (Inkoo, Hamina, Klaipėda, Santaka/GIPL, Inčukalns)
-# Suodatus suoraan API-tasolla estää muistin ylittymisen
-TARGET_POINTS = [
-    'FI-TP-0001', 'FI-TP-0002', # Inkoo / Hamina LNG
-    'LT-TP-0001', 'LT-TP-0002', # Klaipeda LNG / GIPL Santaka
-    'LV-TP-0001'                # Incukalns UGS
-]
-
+# --- 1. ENTSOG DATA: Pikaoperaattorihaku (Vain muutama pyyntö koko 24kk ajalta) ---
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_entsog_chunk(from_str, to_str):
+def fetch_entsog_operator_entry_data(operator_key, start_date_str, end_date_str):
     """
-    Välimuistitetaan yksittäiset 14 päivän jaksot erikseen. 
-    Näin sliderin siirtäminen ei tee koko haku uudestaan, 
-    vaan hyödyntää aiemmin ladatut pätkät.
+    Hakee tietyn operaattorin (Gasgrid Finland, Conexus, Amber Grid) entry-virrat suoraan koko 24kk ajalta.
     """
     url = "https://transparency.entsog.eu/api/v1/operationalData.json"
     offset = 0
     limit = 5000
-    chunk_data = []
+    all_records = []
     
     while True:
         params = {
             'indicator': 'Physical Flow',
-            'from': from_str,
-            'to': to_str,
+            'from': start_date_str,
+            'to': end_date_str,
             'limit': limit,
             'offset': offset,
-            'directionKey': 'entry' # Haetaan vain entry-virrat
+            'directionKey': 'entry',
+            'operatorKey': operator_key
         }
         
         try:
-            response = requests.get(url, params=params, timeout=20)
+            response = requests.get(url, params=params, timeout=15)
             if response.status_code == 200:
                 data = response.json().get('operationalData', [])
                 if not data:
                     break
-                chunk_data.extend(data)
+                all_records.extend(data)
                 if len(data) < limit:
                     break
                 offset += limit
-            elif response.status_code == 404:
-                break
             else:
-                time.sleep(1)
                 break
         except Exception:
             break
             
-    return chunk_data
+    return all_records
 
-def get_all_entsog_data(start_date_str, end_date_str):
+
+@st.cache_data(ttl=86400, show_spinner="Fast loading 24-month ENTSOG gas supply flows...")
+def fetch_full_entsog_entry_history():
     """
-    Kokoaa haun hyödyntäen välimuistitettuja pätkiä.
+    Lataa 24 kuukauden historiandatan taustalle muistiin.
+    Suoritetaan vain kerran, minkä jälkeen sliderin käyttö on välitöntä.
     """
-    start_dt = datetime.strptime(start_date_str, '%Y-%m-%d')
-    end_dt = datetime.strptime(end_date_str, '%Y-%m-%d')
+    today = datetime.today()
+    first_day_current_month = today.replace(day=1)
+    start_dt = (first_day_current_month - timedelta(days=24 * 31)).replace(day=1)
     
-    all_records = []
-    current_start = start_dt
+    start_date_str = start_dt.strftime('%Y-%m-%d')
+    end_date_str = today.strftime('%Y-%m-%d')
     
-    total_days = (end_dt - start_dt).days or 1
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    # Suomen (Gasgrid), Latvian (Conexus) ja Liettuan (Amber Grid) TSO-operaattorit
+    operators = ['FI-TSO-0001', 'LV-TSO-0001', 'LT-TSO-0001']
+    all_data = []
     
-    while current_start < end_dt:
-        current_end = min(current_start + timedelta(days=14), end_dt)
-        from_str = current_start.strftime('%Y-%m-%d')
-        to_str = current_end.strftime('%Y-%m-%d')
+    for op in operators:
+        records = fetch_entsog_operator_entry_data(op, start_date_str, end_date_str)
+        all_data.extend(records)
         
-        elapsed_days = (current_start - start_dt).days
-        progress_bar.progress(min(elapsed_days / total_days, 1.0))
-        status_text.text(f"Fetching/Loading cached data: {from_str} to {to_str}...")
-        
-        # Haetaan pätkä (tulee välimuistista jos ladattu jo)
-        chunk = fetch_entsog_chunk(from_str, to_str)
-        all_records.extend(chunk)
-        
-        current_start = current_end + timedelta(days=1)
-        
-    progress_bar.empty()
-    status_text.empty()
-    return pd.DataFrame(all_records)
+    return pd.DataFrame(all_data)
+
 
 def classify_flow(row):
     point_label = str(row.get('pointLabel', '')).lower()
@@ -113,30 +96,24 @@ def classify_flow(row):
             
     return None
 
-# --- UI / Streamlit App ---
+
+# --- 2. KÄYTTÖLIITTYMÄ (STREAMLIT UI) ---
 
 st.title("🔥 FinBalt Natural Gas Entry Flows")
 st.markdown("Monthly gas supply volumes into the Finnish-Baltic regional gas market (TWh/month). Data source: **ENTSOG Transparency Platform**.")
 
 st.sidebar.header("Settings")
-months_to_fetch = st.sidebar.slider("Select time period (months):", min_value=3, max_value=24, value=6, step=1)
+months_to_show = st.sidebar.slider("Select time period (months):", min_value=3, max_value=24, value=12, step=1)
 
 if st.sidebar.button("Clear Cache & Refresh 🔄"):
     st.cache_data.clear()
     st.rerun()
 
-today = datetime.today()
-first_day_current_month = today.replace(day=1)
-start_dt = (first_day_current_month - timedelta(days=months_to_fetch * 31)).replace(day=1)
-
-start_date = start_dt.strftime('%Y-%m-%d')
-end_date = today.strftime('%Y-%m-%d')
-
-# Haetaan data uutta pätkä-välimuistia hyödyntäen
-df_raw = get_all_entsog_data(start_date, end_date)
+# Datan haku taustalle (Salamannopea operaattorihaku)
+df_raw = fetch_full_entsog_entry_history()
 
 if df_raw.empty:
-    st.warning("No data retrieved from ENTSOG API. Please try again or reduce the selected range.")
+    st.warning("No data retrieved from ENTSOG API. Please try clicking 'Clear Cache & Refresh'.")
 else:
     df_raw['Category'] = df_raw.apply(classify_flow, axis=1)
     df_filtered = df_raw.dropna(subset=['Category']).copy()
@@ -164,19 +141,27 @@ else:
             'Klaipėda LNG', 
             'Inkoo & Hamina LNG'
         ]
-        existing_cols = [col for col in categories_order if col in pivot_df.columns]
-        pivot_df = pivot_df[existing_cols].tail(months_to_fetch)
         
-        latest_month = pivot_df.index[-1]
-        latest_total = pivot_df.loc[latest_month].sum()
+        # Varmistetaan kaikkien sarakkeiden olemassaolo
+        for col in categories_order:
+            if col not in pivot_df.columns:
+                pivot_df[col] = 0.0
+                
+        pivot_df = pivot_df[categories_order]
+        
+        # Slider-leikkaus nopeasti muistissa olevasta datasta (0 ms)
+        df_display = pivot_df.tail(months_to_show)
+        
+        latest_month = df_display.index[-1]
+        latest_total = df_display.loc[latest_month].sum()
         
         # --- Overview Metrics ---
         st.subheader(f"Latest Month Overview ({latest_month})")
-        m_cols = st.columns(len(existing_cols) + 1)
+        m_cols = st.columns(len(categories_order) + 1)
         
         m_cols[0].metric(label="Total Supply", value=f"{latest_total:.3f} TWh")
-        for idx, col in enumerate(existing_cols):
-            val = pivot_df.loc[latest_month, col]
+        for idx, col in enumerate(categories_order):
+            val = df_display.loc[latest_month, col]
             m_cols[idx + 1].metric(label=col, value=f"{val:.3f} TWh")
             
         st.markdown("---")
@@ -184,14 +169,14 @@ else:
         # --- Plotly Chart ---
         st.subheader("Monthly Gas Supply by Route (TWh)")
         
-        plot_df = pivot_df.reset_index().melt(id_vars='Month', var_name='Entry Route', value_name='TWh')
+        plot_df = df_display.reset_index().melt(id_vars='Month', var_name='Entry Route', value_name='TWh')
         
         fig = px.bar(
             plot_df, 
             x='Month', 
             y='TWh', 
             color='Entry Route',
-            title=f"FinBalt Natural Gas Entry Flows (Last {months_to_fetch} Months)",
+            title=f"FinBalt Natural Gas Entry Flows (Last {months_to_show} Months)",
             labels={'TWh': 'Energy (TWh / month)', 'Month': 'Month'},
             template='plotly_white',
             color_discrete_sequence=px.colors.qualitative.Set2
@@ -209,7 +194,7 @@ else:
         
         # --- Data Table ---
         st.subheader("Data Summary Table")
-        display_df = pivot_df.copy()
+        display_df = df_display.copy()
         display_df['Total (TWh)'] = display_df.sum(axis=1)
         
         st.dataframe(display_df.style.format("{:.3f}"), use_container_width=True)
